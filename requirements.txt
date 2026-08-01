@@ -1,0 +1,32 @@
+# Core dependencies
+pymavlink>=2.4.40
+numpy>=1.24.0
+opencv-python>=4.8.0
+piexif>=1.1.3
+
+# Detector
+ultralytics>=8.0.0
+
+# torch and torchvision are NOT listed here on purpose.
+#
+# On a Jetson you must install the NVIDIA JetPack wheels (CUDA-specific), not the generic
+# PyPI builds:
+#   https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform/
+#
+# torchvision is REQUIRED: the detector uses torchvision.ops.batched_nms for cross-tile
+# NMS. Without it, overlapping boxes from different tiles are never merged and you get
+# duplicate detections.
+#
+# On a desktop or in CI, plain `pip install torch torchvision` is fine.
+
+# Jetson.GPIO is only needed on the companion computer itself, for the payload:
+#   pip install Jetson.GPIO
+#   sudo usermod -aG gpio $USER
+#
+# On any other machine the flight code imports fine without it; only suas.payload.*
+# requires it.
+
+# OpenCV note:
+# The pip `opencv-python` wheel is built WITHOUT GStreamer. On a Jetson, the system
+# (JetPack) OpenCV has it, and run.sh puts that build first on PYTHONPATH so the camera
+# and the video stream work. Do not uninstall either one.

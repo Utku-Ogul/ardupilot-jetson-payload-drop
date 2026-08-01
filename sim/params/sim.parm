@@ -1,0 +1,54 @@
+# ArduCopter SITL parameters for testing this system.
+#
+# These mirror the safety backstops the companion code RELIES ON, so the simulation
+# exercises the same failsafe behaviour as a real flight. See docs/FLIGHT_CONTROLLER.md
+# for the values to write to a real vehicle -- they are NOT identical (notably
+# ARMING_CHECK, FENCE_RADIUS and the battery settings).
+
+# --- Airframe ---
+FRAME_CLASS,1
+FRAME_TYPE,1
+MOT_THST_EXPO,0.60
+MOT_THST_HOVER,0.55
+MOT_SPIN_MIN,0.15
+MOT_SPIN_ARM,0.10
+MOT_SPIN_MAX,0.95
+
+# --- Attitude control ---
+ATC_RAT_RLL_P,0.08
+ATC_RAT_RLL_I,0.08
+ATC_RAT_RLL_D,0.003
+ATC_RAT_PIT_P,0.08
+ATC_RAT_PIT_I,0.08
+ATC_RAT_PIT_D,0.003
+ATC_ANG_RLL_P,4.5
+ATC_ANG_PIT_P,4.5
+ATC_ANG_YAW_P,4.5
+
+# --- Navigation speed -------------------------------------------------------
+# Keep these ABOVE the IBVS limits in config.py (IBVS_MAX_VEL / IBVS_SLEW) so the
+# visual servoing stays the gentler of the two.
+WPNAV_SPEED,150         # 1.5 m/s -- gentle approach to the target
+WPNAV_ACCEL,50          # 0.5 m/s^2 -- aligned with IBVS_SLEW
+WPNAV_JERK,1
+ANGLE_MAX,2000
+
+# --- Simulation only --------------------------------------------------------
+SIM_BATT_VOLTAGE,25.2
+ARMING_CHECK,0          # SIM ONLY. On a real vehicle this MUST be non-zero.
+MIS_RESTART,0           # do not restart the mission from the beginning
+
+# --- Failsafe / fence / deadman ---------------------------------------------
+# The companion code DEPENDS on these; preflight_param_check verifies them.
+GUID_TIMEOUT,3          # velocity deadman: brake ~3s after the companion stops commanding
+FENCE_ENABLE,1          # geofence on (the last wall)
+FENCE_TYPE,11           # max altitude + circle + min altitude
+FENCE_ACTION,4          # Brake in simulation; NEVER 0
+FENCE_RADIUS,120        # horizontal fence radius [m]
+FENCE_ALT_MAX,50        # survey altitude plus margin
+FENCE_MARGIN,6          # stopping distance allowance
+FS_GCS_ENABLE,1         # RTL if the companion heartbeat (sysid 254) stops
+FS_GCS_TIMEOUT,5        # seconds from heartbeat loss to failsafe
+MAV_GCS_SYSID,254       # MUST match the companion source_system (FW < 4.5: SYSID_MYGCS)
+FS_EKF_ACTION,1         # land if the EKF diverges
+FS_EKF_THRESH,0.8

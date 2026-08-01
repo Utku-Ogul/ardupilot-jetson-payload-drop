@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Runtime output
+logs/
+survey_photos/
+preview_out/
+calibration/
+*.log
+
+# Model artefacts
+# best.pt is tracked (see models/README.md). A TensorRT engine is specific to the
+# JetPack/CUDA/GPU it was built on and must NEVER be committed -- build it on the target
+# with tools/export_tensorrt.py.
+models/*.engine
+models/*.onnx
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local agent/tool configuration
+.claude/
