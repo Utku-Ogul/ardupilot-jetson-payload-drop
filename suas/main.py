@@ -116,7 +116,7 @@ def main():
     log.info("=" * 32)
     log.info("Connection: %s", args.connect)
 
-    mav = connect()
+    mav = connect(args.connect)
     # Critical FC safety parameters. A mismatch BLOCKS a real flight.
     crit_ok = preflight_param_check(mav)
     if not SIM_MODE and not crit_ok:

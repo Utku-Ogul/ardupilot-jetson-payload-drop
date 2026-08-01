@@ -37,7 +37,7 @@ from suas.config import (ACQUIRE_MAX_SAMPLES, ACQUIRE_MIN_SAMPLES, ACQUIRE_REFIN
                          IBVS_DIVERGE_PITCH_DEG, IBVS_DIVERGE_S, IBVS_FX,
                          IBVS_LATCH_SPEED, IBVS_LOSS_GRACE_S, IBVS_TARGET_FENCE_M,
                          IBVS_TIMEOUT_S, PAYLOAD_ALT_MAX, PAYLOAD_ALT_MIN,
-                         PAYLOAD_ENABLED, PAYLOAD_REVERSE, SIM_MODE,
+                         PAYLOAD_ENABLED, PAYLOAD_REVERSE, PAYLOAD_TARGETS, SIM_MODE,
                          STREAM_BITRATE, STREAM_ENABLED, STREAM_FPS, STREAM_HEIGHT,
                          STREAM_HOST, STREAM_IDR_SEC, STREAM_PORT, STREAM_WIDTH,
                          TARGET_CLUSTER_RADIUS_M, TARGET_MAX_ATTEMPTS, TARGET_WAIT_SEC,
@@ -1177,7 +1177,7 @@ class SuasTracker:
         """Launch the payload drop sequence as a SEPARATE process.
 
         The target class selects the servo, motor and release angle; the single source of
-        truth for that mapping is suas/payload/drop_sequence.py TARGETS.
+        truth for that mapping is PAYLOAD_TARGETS in config.json.
 
         This does NOT block the tracker loop:
           * subprocess.Popen returns immediately; the state machine keeps running.
@@ -1206,11 +1206,15 @@ class SuasTracker:
             log.warning("The previous payload child is still running -- stopping it first")
             self._stop_payload()   # never overwrite a live handle -> no orphaned motor
 
-        # Target class -> the --target argument that selects the servo and motor.
-        # An unknown or empty label NEVER triggers a motor.
+        # Target class -> the --target argument that selects the servo and motor. The set of
+        # valid classes comes from PAYLOAD_TARGETS in config.json, so changing the classes
+        # does not need a code edit. A class with no entry there (or an empty label) NEVER
+        # triggers a motor.
         target = self._target_label
-        if target not in ("mannequin", "tent"):
-            log.warning("Payload: unknown target class '%s' -> no actuation (skipped)", target)
+        if target not in PAYLOAD_TARGETS:
+            log.warning("Payload: '%s' has no entry in PAYLOAD_TARGETS (config.json) -> no "
+                        "actuation (skipped). Configured targets: %s",
+                        target, sorted(PAYLOAD_TARGETS) or "(none)")
             return
 
         log_dir = os.path.join(_REPO_ROOT, "logs")

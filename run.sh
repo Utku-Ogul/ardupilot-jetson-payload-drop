@@ -22,7 +22,18 @@
 #   (every suas.main argument is passed straight through)
 # -----------------------------------------------------------------------------
 cd "$(dirname "$0")" || exit 1
-export PYTHONPATH="/usr/lib/python3.10/dist-packages:${PYTHONPATH}"
+
+# Derive the dist-packages path from the running interpreter (JetPack 6 = 3.10,
+# newer images differ) instead of hard-coding a version that silently does nothing.
+PYVER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+SYS_CV2_DIR="/usr/lib/python${PYVER}/dist-packages"
+if [ -d "$SYS_CV2_DIR" ]; then
+    export PYTHONPATH="${SYS_CV2_DIR}:${PYTHONPATH}"
+else
+    echo ">> NOTE: $SYS_CV2_DIR not found -- using the default OpenCV."
+    echo ">> If it lacks GStreamer, the camera falls back to FFMPEG and the ground"
+    echo ">> video stream disables itself (flight is unaffected)."
+fi
 
 # Stop the RTSP FFMPEG fallback from blocking forever in cap.read() on a half-open TCP
 # connection (camera or Wi-Fi loss). Without this, read() never returns, the camera

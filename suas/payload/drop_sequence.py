@@ -275,17 +275,22 @@ def _run_drop(spec, reverse):
 
 def main():
     ap = argparse.ArgumentParser(description="Target-selective payload drop sequence")
+    # The choices and the help text are derived from config.json, so changing the target
+    # classes never leaves this out of date.
+    target_help = "; ".join(
+        f"{k} -> servo pin {v['servo_pin']} + motor {v['motor']}"
+        for k, v in sorted(TARGETS.items())) or "(none configured)"
     ap.add_argument("--target", choices=sorted(TARGETS.keys()),
-                    help="target class (mannequin -> servo pin 7 + motor B, "
-                         "tent -> servo pin 12 + motor A)")
+                    help=f"target class ({target_help})")
     ap.add_argument("--init", action="store_true",
-                    help="move both servos to the neutral angle (no motor)")
+                    help="move every configured servo to the neutral angle (no motor)")
     ap.add_argument("--reverse", action="store_true",
                     help="temporarily invert the motor direction")
     args = ap.parse_args()
 
     if not args.init and not args.target:
-        ap.error("provide --target <mannequin|tent> or --init.")
+        ap.error(f"provide --init, or --target with one of: "
+                 f"{', '.join(sorted(TARGETS)) or '(none configured -- set PAYLOAD_TARGETS)'}")
 
     if not GPIO_AVAILABLE:
         ap.error("Jetson.GPIO is not installed -- this sequence drives real hardware and "

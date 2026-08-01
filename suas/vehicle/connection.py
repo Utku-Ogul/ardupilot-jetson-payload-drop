@@ -63,15 +63,21 @@ def start_companion_heartbeat(mav):
     log.info("Companion GCS heartbeat started (sysid=254, 1 Hz -- FS_GCS deadman)")
 
 
-def connect() -> mavutil.mavfile:
-    if not MAVLINK_CONNECT:
+def connect(endpoint: str = None) -> mavutil.mavfile:
+    """Open the MAVLink link.
+
+    endpoint overrides config (main.py passes --connect); None uses MAVLINK_CONNECT.
+    """
+    endpoint = endpoint or MAVLINK_CONNECT
+    if not endpoint:
         key = "MAVLINK_CONNECT_SIM" if SIM_MODE else "MAVLINK_CONNECT_REAL"
         raise SystemExit(
-            f"{key} is empty. Set it in config.json (section flight_controller).\n"
+            f"{key} is empty. Set it in config.json (section flight_controller), "
+            f"or pass --connect.\n"
             "  Serial: run  ls -l /dev/serial/by-id/  and use the full by-id path\n"
             "          (usually the interface ending in -if00), not /dev/ttyACM0.\n"
             "  Network: use e.g. udpin:0.0.0.0:14550 or tcp:127.0.0.1:5760.")
-    log.info("Connecting MAVLink: %s", MAVLINK_CONNECT)
+    log.info("Connecting MAVLink: %s", endpoint)
     # Unique GCS identity (254), separate from vehicle (1) and ground station (255).
     # Must match MAV_GCS_SYSID on the flight controller; this makes the companion its
     # own deadman.
@@ -79,7 +85,7 @@ def connect() -> mavutil.mavfile:
     # A USB/serial link can drop on brownout, cable movement or re-enumeration, so we
     # enable autoreconnect for serial devices. UDP (SITL) does not accept that kwarg
     # (TypeError), so only add it for serial device paths.
-    is_serial = not any(MAVLINK_CONNECT.startswith(p) for p in ("udp", "tcp"))
+    is_serial = not any(endpoint.startswith(p) for p in ("udp", "tcp"))
     kw = dict(source_system=254,
               source_component=mavutil.mavlink.MAV_COMP_ID_MISSIONPLANNER,
               baud=57600)   # NOTE: baud is meaningless over USB CDC (throughput is USB
@@ -87,7 +93,7 @@ def connect() -> mavutil.mavfile:
                             # bottleneck -> raise it to 921600.
     if is_serial:
         kw["autoreconnect"] = True
-    mav = mavutil.mavlink_connection(MAVLINK_CONNECT, **kw)
+    mav = mavutil.mavlink_connection(endpoint, **kw)
     # Several threads (main + tracker + mapping) read the same connection -> serialise recv.
     mav.recv_lock = threading.Lock()
     # The same threads also WRITE to it (1 Hz heartbeat + tracker velocity + mission +
@@ -103,7 +109,7 @@ def connect() -> mavutil.mavfile:
         if is_serial:
             log.warning("Waiting for heartbeat (%ds)... Does the path '%s' exist "
                         "(ls -l /dev/serial/by-id/)? Is the FC powered? Is ModemManager "
-                        "removed? Is the user in the 'dialout' group?", waited, MAVLINK_CONNECT)
+                        "removed? Is the user in the 'dialout' group?", waited, endpoint)
         else:
             log.warning("Waiting for heartbeat (%ds)... Is SITL running? Is the network "
                         "route to the simulator up?", waited)

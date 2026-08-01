@@ -32,6 +32,13 @@ if _enabled:
     except ImportError:
         _enabled = False
         log.error("Jetson.GPIO not found -- GPIO indicators disabled")
+    except Exception as e:
+        # Library present but the board is not recognised / the pins are busy / no
+        # permission. Disable the indicators rather than killing the import of main.py:
+        # they are cosmetic, and the payload runs in its own process anyway.
+        _enabled = False
+        log.error("GPIO init failed (%s) -- indicators disabled. Check the 'gpio' group "
+                  "membership and that no other process holds the pins.", e)
 else:
     log.info("GPIO indicators disabled (simulation mode)")
 
