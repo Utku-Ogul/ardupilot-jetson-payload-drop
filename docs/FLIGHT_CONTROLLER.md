@@ -16,15 +16,17 @@ flight** at startup (`preflight_param_check`).
 
 | Parameter | Value | If it is wrong |
 |---|---|---|
-| `MAV_GCS_SYSID` | **254** | The companion deadman never works. On firmware < 4.5 this is `SYSID_MYGCS`. |
 | `FENCE_ENABLE` | **1** | No last-wall geofence. **Blocks startup.** |
 | `GUID_TIMEOUT` | **3** | A stalled companion leaves a live velocity setpoint running. **Blocks startup.** |
+| `SYSID_ENFORCE` | **0** | The companion's (sysid 254) GUIDED / goto / velocity commands are silently rejected. **Blocks startup.** |
+| `SYSID_MYGCS` | **255** | The ground station. `FS_GCS` must watch the ground link, not the companion. On newer firmware this is `MAV_GCS_SYSID`. |
 | `SERIAL0_PROTOCOL` | **2** (MAVLink2) | The companion cannot talk over USB. |
 | `ARMING_CHECK` | **1** | Arming with an uncalibrated or unhealthy vehicle. |
 
-`MAV_GCS_SYSID = 254` is the single most important line here. The companion connects with
-`source_system = 254`, and that is what makes its heartbeat a real deadman rather than
-decoration.
+The companion connects with `source_system = 254`, distinct from the ground station (255).
+`SYSID_MYGCS = 255` makes `FS_GCS` watch the ground link (SUAS 2026: 15 s comms loss ->
+RTL); if the companion itself stops, `GUID_TIMEOUT` brakes the vehicle within 3 s.
+Do not set `SYSID_ENFORCE = 1` -- the companion would lose command authority in the air.
 
 ---
 
@@ -32,16 +34,17 @@ decoration.
 
 | Parameter | Suggested | Meaning |
 |---|---|---|
-| `FS_GCS_ENABLE` | 1 | Act when the companion heartbeat stops |
-| `FS_GCS_TIMEOUT` | 5 | Seconds from heartbeat loss to failsafe |
+| `FS_GCS_ENABLE` | 1 | RTL when the ground-station heartbeat stops |
+| `FS_GCS_TIMEOUT` | 15 | Seconds from heartbeat loss to failsafe (SUAS 2026 Appendix B) |
+| `FS_OPTIONS` | 0 | Bit 1 off: RTL on GCS loss in AUTO too |
+| `FS_THR_ENABLE` | 1 | RC loss -> RTL. Also required by `lua/comms_loss_termination.lua` |
 | `FENCE_TYPE` | 3 | Circle + altitude ceiling |
 | `FENCE_ACTION` | 4 (Brake) or 1 (RTL) | What happens at the boundary |
 | `FENCE_RADIUS` | site dependent | Horizontal limit from home |
-| `FENCE_ALT_MAX` | survey altitude + margin | Altitude ceiling |
+| `FENCE_ALT_MAX` | 80 | Altitude ceiling (50 m survey + margin; must be well above the mission altitude) |
 | `FENCE_MARGIN` | 6 | Stopping-distance allowance |
 | `FS_EKF_ACTION` | 1 | Land if the EKF diverges |
 | `FS_EKF_THRESH` | 0.8 | EKF failsafe threshold |
-| `FS_THR_ENABLE` | 1 | RC loss behaviour |
 | `FS_VIBE_ENABLE` | 1 | Vibration failsafe |
 | `BATT_MONITOR` | > 0 | Battery monitoring on |
 | `BATT_FS_LOW_ACT` | >= 1 | Low-battery action |
@@ -60,13 +63,18 @@ Never use `0`.
 
 ## 3. Navigation speed
 
-The visual servoing limits in `config.json` must stay **below** the autopilot's
-navigation limits, so IBVS is always the gentler of the two.
+The visual servoing limits in `suas/config.py` must stay **below** the autopilot's
+navigation limits, so IBVS is always the gentler of the two. IBVS clamps its own command to
+`IBVS_MAX_VEL`, so a faster `WPNAV_SPEED` does not make centring more aggressive -- it only
+speeds up the GUIDED transit to the target, after which `GOTO_SETTLE_MAX_SPEED` waits for
+the vehicle to actually stop before IBVS starts.
 
-| Parameter | Suggested | Paired config value |
+| Parameter | As flown | Paired config value |
 |---|---|---|
-| `WPNAV_SPEED` | 150 (1.5 m/s) | `IBVS_MAX_VEL`: 0.8 |
-| `WPNAV_ACCEL` | 50 (0.5 m/s²) | `IBVS_SLEW`: 0.5 |
+| `WPNAV_SPEED` | 500 (5 m/s, GUIDED goto) | `IBVS_MAX_VEL`: 0.8, `GOTO_TIMEOUT_S`: 240 |
+| `WPNAV_ACCEL` | 250 (2.5 m/s²) | `GOTO_SETTLE_MAX_SPEED`: 0.5 |
+| `WPNAV_RADIUS` | 500 (5 m) | SUAS waypoint threshold < 50 ft |
+| `RTL_ALT` | 5000 (50 m) | survey altitude -- RTL never descends first |
 | `ANGLE_MAX` | 2000–3000 (20–30°) | `FIRE_TILT_MAX_DEG`: 35 |
 
 A larger `ANGLE_MAX` gives more tilt authority in wind. Keep `FIRE_TILT_MAX_DEG` above it
@@ -86,7 +94,12 @@ actually emits `MISSION_ITEM_REACHED` — ArduCopter never emits one for a termi
 `LOITER_UNLIM` — so it triggers on the item *before* it (usually the final waypoint's
 DELAY). That way the last photo and its delay both complete.
 
-Add a `WP_DELAY` of a few seconds to each waypoint if you want stabilised mapping photos.
+**SUAS mission layout.** `TAKEOFF` (50 m) -> the required waypoint lap -> optional
+`DO_CHANGE_SPEED` -> mapping grid (`NAV_WAYPOINT` + `NAV_DELAY 4 s` each) -> terminal
+`NAV_LOITER_UNLIM`. At startup choose the **first mapping waypoint** as the mapping start
+sequence: photos and target recording start there, so targets seen on the lap are ignored.
+Keep `NAV_DELAY >= STABILIZE_TIMEOUT + 1 s`. Do not put a `DO_` command directly before the
+terminal loiter. Restart `run.sh` after uploading a new mission.
 
 ---
 
@@ -100,7 +113,7 @@ ls -l /dev/serial/by-id/
 ```
 
 Pick the MAVLink interface (commonly the one ending `-if00`) and put it in
-`MAVLINK_CONNECT_REAL` in `config.json` (section `flight_controller`).
+`MAVLINK_CONNECT_REAL` in `suas/config.py`.
 
 Then, on the companion:
 
@@ -122,7 +135,7 @@ so a gimbal that is not pointing down produces garbage coordinates.
 
 **Option A — gimbal wired to the flight controller (preferred).** Configure your gimbal
 driver (e.g. `MNT1_TYPE`) so ArduPilot can command and read it. Set
-`"GIMBAL_MANUAL_NADIR": false` in `config.json`. The companion commands nadir at startup and before each
+`GIMBAL_MANUAL_NADIR = False` in `suas/config.py`. The companion commands nadir at startup and before each
 target, and verifies it through telemetry.
 
 Verify before flying: use a MAVLink inspector to confirm which message your firmware emits
@@ -131,7 +144,7 @@ physical nadir really reads pitch ≈ −90°. A sign error keeps the gate perma
 and IBVS will never start.
 
 **Option B — RC-only gimbal.** If the gimbal is controlled purely by RC with no telemetry
-to the flight controller, set `"GIMBAL_MANUAL_NADIR": true`. The gate then passes
+to the flight controller, set `GIMBAL_MANUAL_NADIR = True`. The gate then passes
 unconditionally and `run.sh` prompts the operator to confirm before every flight. The
 operator must point the gimbal fully down before takeoff and leave it there. All other
 safety gates are unaffected.
@@ -150,7 +163,7 @@ Nothing here substitutes for a properly calibrated vehicle:
 
 And for this system specifically: **camera field of view**. `CAMERA_HFOV_DEG` defaults to
 the manufacturer spec, and both `IBVS_FX` and `pixel_to_gps` derive from it, so a 10%
-error becomes metres of geolocation error at 20 m altitude. Measure it:
+error becomes metres of geolocation error at a 50 m survey altitude. Measure it:
 
 ```bash
 python3 tools/calibrate_camera.py capture --cols 9 --rows 6

@@ -1,24 +1,28 @@
 # SUAS — Autonomous Aerial Search, Geolocation and Payload Delivery
 
-An onboard companion-computer system for a multirotor UAV. It flies a survey mission,
+An onboard companion-computer system for a multirotor UAV, built for the **SUAS 2026**
+competition (50 m / ≥ 150 ft AGL survey). It flies a survey mission,
 detects ground targets with a YOLO model, estimates their GPS positions, flies back to
 each one, centres on it with visual servoing, and releases a payload.
 
 Everything runs on a Jetson bolted to the aircraft, talking to an ArduPilot flight
-controller over USB. All settings live in a single `config.json`, so you can adapt it to
-your own airframe, camera and release mechanism without touching the code.
+controller over USB. All settings live in a single file, `suas/config.py`, so you can adapt
+it to your own airframe, camera and release mechanism without touching the logic.
 
 > **Safety notice.** This software commands a real aircraft and actuates real hardware.
 > Read [docs/SAFETY.md](docs/SAFETY.md) before flying it. Keep `GPIO_ENABLED` and
-> `PAYLOAD_ENABLED` set to `false` until the payload has been bench tested.
+> `PAYLOAD_ENABLED` set to `False` until the payload has been bench tested.
 
 ---
 
 ## What it actually does
 
 ```
-AUTO survey            Fly the uploaded waypoint mission, photographing each waypoint
-      |                (GPS-tagged) and running detection continuously.
+Takeoff + lap          AUTO: takeoff and the required waypoint lap. The detector runs,
+      |                but nothing is recorded yet.
+      v
+AUTO survey            From the mapping start item on: photograph each waypoint
+      |                (GPS-tagged) and record mannequin/tent candidates.
       v
 Target confirmation    A detection visible for 3 s becomes a candidate. Each candidate
       |                accumulates GPS samples; the position is a median with 2-sigma
@@ -39,9 +43,15 @@ Settle, then release   Hold position over the target, confirm every safety gate,
 Next target / hover
 ```
 
-If visual servoing cannot centre the target, the acceptance tolerance widens in steps
-(2 m → 6 m → 10 m). If it still fails, the aircraft flies to the saved GPS position and
-performs a blind release — but only while every *vehicle* safety gate still passes.
+If visual servoing cannot centre the target, the acceptance tolerance widens along an
+explicit ladder (`IBVS_CENTER_TOL_LADDER`, default 8 m × 1 → 11 m × 1). If it still fails,
+the aircraft flies to the saved GPS position and performs a blind release — but only while
+every *vehicle* safety gate still passes.
+
+**Mapping start.** At startup the companion downloads the mission and asks for the mapping
+start sequence (or take it from `--photo-start-wp N`). Choose the **first mapping waypoint,
+not the lap**: photo capture and target recording both start when the mission reaches it,
+so targets seen during takeoff, the lap or transit never enter the candidate pool.
 
 ---
 
@@ -67,14 +77,13 @@ Two independent release mechanisms, one per target class. When a target is centr
 every gate passes:
 
 1. The **servo** for that class rotates from its neutral angle to its release angle
-   (mannequin `90° → 30°` on pin 7, tent `90° → 150°` on pin 12 — they open in opposite
-   directions).
-2. After a short pause, the **motor** for that class runs forward at 100 % for 20 s,
+   (mannequin `90° → 10°` on pin 12, tent `90° → 10°` on pin 7).
+2. After a short pause, the **motor** for that class runs forward at 100 % for 45 s,
    paying out the payload.
 
 The whole sequence runs as a **separate process** with its own deadman, so if the tracker
 dies the motor is de-energised instead of being left at full power. Pins, angles and
-timings are all in `config.json` under `payload_hardware`.
+timings are all in `suas/config.py` (`PAYLOAD_TARGETS`, `SERVO_*`, `MOTOR_*`).
 
 ### Wiring
 
@@ -82,8 +91,8 @@ Pin numbers are BOARD (physical header) numbering.
 
 | Function | Pin(s) |
 |---|---|
-| Servo 1 (mannequin) | 7 |
-| Servo 2 (tent) | 12 |
+| Servo (tent) | 7 |
+| Servo (mannequin) | 12 |
 | Motor A (tent) | 32 forward, 33 reverse |
 | Motor B (mannequin) | 29 forward, 31 reverse |
 | Buzzer | 13 |
@@ -160,49 +169,40 @@ is in the `gpio` group, because `Jetson.GPIO` uses the `/dev/gpiochip` (libgpiod
 
 ### 5. Model weights
 
-Put your trained YOLO weights at `models/best.pt`, with two classes named `mannequin` and
-`tent`. See [models/README.md](models/README.md) for training or changing the classes.
+The weights are **not** in the repository. Copy them to `models/v14_best.pt` (the
+`MODEL_FILE` default), with two classes named `mannequin` and `tent`, then build the
+TensorRT engine on the Jetson with `python3 tools/export_tensorrt.py`. See
+[models/README.md](models/README.md).
 
 ---
 
 ## Configuration — one file
 
-**Edit `config.json`. Do not edit the Python.**
+**Edit `suas/config.py`.** Every setting lives there, grouped into sections, each with the
+reasoning behind its value. Nothing else reads settings from anywhere else.
 
-Every setting lives there, grouped into readable sections. `suas/config.py` holds the
-defaults and the reasoning behind each one; `config.json` overrides them. A key that is
-absent or `null` keeps its default, so you can leave keys in place as documentation.
+The values as shipped are the ones we flew (SIYI A8 mini, Cube Orange+, 50 m survey).
+Review at least these before using it on other hardware:
 
-Two settings ship **blank**, because they are specific to your own hardware and nothing can
-connect until you fill them in — `tools/show_config.py --check` reports both as errors
-while they are empty:
+| Setting | What it is |
+|---|---|
+| `SIM_MODE` | `True` for SITL, `False` for a real vehicle. Selects the camera source, MAVLink endpoint and several safety behaviours. |
+| `MAVLINK_CONNECT_REAL` | Your flight controller's device path. Find it with `ls -l /dev/serial/by-id/` and use the full by-id path, not `/dev/ttyACM0`. A network endpoint such as `udpin:0.0.0.0:14550` also works. |
+| `CAMERA_RTSP_URL_REAL` | Your camera's stream URL, e.g. `rtsp://<camera-ip>:8554/main.264`. |
+| `CAMERA_HFOV_DEG` | Horizontal field of view. Geolocation accuracy depends on it — measure it with `tools/calibrate_camera.py`. |
+| `GPIO_ENABLED`, `PAYLOAD_ENABLED` | **Keep both `False`** until the payload is wired and bench tested. |
+| `GIMBAL_MANUAL_NADIR` | `True` if your gimbal has no MAVLink telemetry and the operator aims it by RC (our setup). |
+| `PAYLOAD_TARGETS` | Which servo pin, motor channel and release angle belongs to each target class. |
 
-| Setting | Section | What it is |
-|---|---|---|
-| `MAVLINK_CONNECT_REAL` | `flight_controller` | Your flight controller's device path. Find it with `ls -l /dev/serial/by-id/` and use the full by-id path, not `/dev/ttyACM0`. A network endpoint such as `udpin:0.0.0.0:14550` also works. |
-| `CAMERA_RTSP_URL_REAL` | `camera` | Your camera's stream URL, e.g. `rtsp://<camera-ip>:8554/main.264`. The port and path are in your camera's manual. |
-
-The rest you will probably want to review:
-
-| Setting | Section | What it is |
-|---|---|---|
-| `SIM_MODE` | `profile` | `true` for SITL, `false` for a real vehicle. Selects the camera source, MAVLink endpoint and several safety behaviours. |
-| `CAMERA_HFOV_DEG` | `camera` | Horizontal field of view. Geolocation accuracy depends on it — measure it with `tools/calibrate_camera.py`. |
-| `GPIO_ENABLED`, `PAYLOAD_ENABLED` | `payload` | **Keep both `false`** until the payload is wired and bench tested. |
-| `GIMBAL_MANUAL_NADIR` | `gimbal` | `true` if your gimbal has no MAVLink telemetry and the operator aims it by RC (our setup). |
-| `PAYLOAD_TARGETS` | `payload_hardware` | Which servo pin, motor channel and release angle belongs to each target class. |
-
-After editing, always verify:
+After editing, run the configuration checks:
 
 ```bash
-python3 tools/show_config.py            # what resolved, and from where
-python3 tools/show_config.py --changed  # only your overrides
-python3 tools/show_config.py --check    # validation only
+python3 -m unittest discover -s tests -p test_config.py -v
 ```
 
-This flags typos (a misspelled key is *ignored*, which is dangerous for a safety setting),
-missing files, pin collisions, and inconsistent thresholds — for example a
-`TARGET_WAIT_SEC` shorter than the payload sequence, which would cut the motor mid-run.
+They catch the mistakes that are easy to make and dangerous in flight: pin collisions,
+classes that do not match `PAYLOAD_TARGETS`, a `TARGET_WAIT_SEC` shorter than the payload
+sequence (which would cut the motor mid-run), and misaligned IBVS / release envelopes.
 
 ---
 
@@ -213,9 +213,13 @@ wrong. The three that block startup:
 
 | Parameter | Value | Why |
 |---|---|---|
-| `MAV_GCS_SYSID` | **254** | The companion connects as system 254; this is what makes its heartbeat a real deadman. |
 | `FENCE_ENABLE` | **1** | The last-wall geofence. |
 | `GUID_TIMEOUT` | **3** | A stalled companion must not leave a live velocity setpoint running. |
+| `SYSID_ENFORCE` | **0** | Otherwise the companion's (sysid 254) commands are silently rejected. |
+
+The GCS failsafe watches the **ground station**: `SYSID_MYGCS=255`, `FS_GCS_ENABLE=1`,
+`FS_GCS_TIMEOUT=15` (SUAS 2026: 15 s comms loss → RTL). The 90 s comms-loss termination is
+a flight-controller Lua script — see [lua/README.md](lua/README.md).
 
 Full list, wiring and gimbal setup: [docs/FLIGHT_CONTROLLER.md](docs/FLIGHT_CONTROLLER.md).
 
@@ -224,8 +228,8 @@ Full list, wiring and gimbal setup: [docs/FLIGHT_CONTROLLER.md](docs/FLIGHT_CONT
 ## Verify, then fly
 
 ```bash
-python3 -m unittest discover -s tests   # geometry conventions, no hardware needed
-python3 tools/show_config.py            # configuration sanity
+python3 -m unittest discover -s tests   # geometry + configuration checks, no hardware needed
+python3 tests/test_comms_loss_termination.py   # Lua termination logic (needs: pip install lupa)
 python3 tools/bench_test.py             # read-only: link, telemetry, preflight, gates
 python3 tools/preview.py                # live camera + detector, with tuning keys
 python3 tools/payload_test.py           # bench-test the release (payload OFF the aircraft)
@@ -237,7 +241,7 @@ Then:
 ./run.sh                    # with the preview window
 ./run.sh --no-display       # headless / over SSH
 ./run.sh --no-mapping       # no photo capture
-./run.sh --photo-start-wp 5 # start photographing at waypoint 5
+./run.sh --photo-start-wp 5 # mapping (photos + target recording) starts at seq 5
 ```
 
 At startup `run.sh` selects the correct OpenCV, moves both payload servos to neutral, and
@@ -251,11 +255,9 @@ from desk tests to simulation to a field ladder with the payload disarmed.
 ## Repository layout
 
 ```
-config.json               ALL your settings — this is the file you edit
 run.sh                    Launch script
 suas/
-  settings.py             config.json loader (typo detection, defaults)
-  config.py               Defaults + the reasoning behind every value
+  config.py               ALL settings + the reasoning behind every value
   main.py                 Entry point and main loop
   tracker.py              Mission state machine
   mission.py              Mission download and completion detection
@@ -265,10 +267,11 @@ suas/
   mapping/                photo (waypoint capture) · exif
   payload/                drop_sequence · servo · motor · indicators
   streaming/              rtp (annotated H.264 to the ground)
-models/                   YOLO weights
-tools/                    show_config · bench_test · preview · calibrate_camera ·
-                          payload_test · export_tensorrt
-tests/                    Unit tests (no hardware)
+models/                   YOLO weights (not tracked) + training notebook
+lua/                      Flight-controller Lua scripts (90 s comms-loss termination)
+tools/                    bench_test · preview · calibrate_camera · payload_test ·
+                          export_tensorrt
+tests/                    Unit tests (no hardware): geometry, configuration, Lua logic
 sim/                      SITL + Gazebo launch and parameters
 docs/                     Safety, flight controller, setup, preflight, ground station
 ```
@@ -282,14 +285,14 @@ docs/                     Safety, flight controller, setup, preflight, ground st
 and return it from `_build_detector()` in `suas/tracker.py`.
 
 **Different payload.** `suas/payload/drop_sequence.py` is a standalone script driven
-entirely by `config.json`. The tracker only launches it with `--target <class>`, so you can
+entirely by `suas/config.py`. The tracker only launches it with `--target <class>`, so you can
 replace the mechanism completely without touching the state machine.
 
-**Different classes.** Update `CLASS_NAMES` and `PAYLOAD_TARGETS` in `config.json`.
-`tools/show_config.py` verifies they agree; the detector warns if the loaded weights
+**Different classes.** Update `CLASS_NAMES` and `PAYLOAD_TARGETS` in `suas/config.py`.
+`tests/test_config.py` verifies they agree; the detector warns if the loaded weights
 disagree.
 
-**No gimbal.** Set `ACQUIRE_TILT_GATE` to `true`, so target samples are only taken from
+**No gimbal.** Set `ACQUIRE_TILT_GATE` to `True`, so target samples are only taken from
 level frames (a tilted airframe shifts the nadir projection).
 
 **Different flight controller.** Anything ArduPilot works. The MAVLink layer is confined
@@ -300,7 +303,7 @@ to `suas/vehicle/`.
 ## Documentation
 
 - [docs/SAFETY.md](docs/SAFETY.md) — the layered safety model, every gate, and what happens when each fails
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every setting in `config.json`
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every setting in `suas/config.py`
 - [docs/FLIGHT_CONTROLLER.md](docs/FLIGHT_CONTROLLER.md) — ArduPilot parameters, wiring, gimbal
 - [docs/SETUP.md](docs/SETUP.md) — companion computer, network, camera, payload wiring
 - [docs/PREFLIGHT.md](docs/PREFLIGHT.md) — bench and pre-flight checklist

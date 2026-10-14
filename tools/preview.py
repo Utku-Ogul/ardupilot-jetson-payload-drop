@@ -4,7 +4,7 @@ Live camera + detector preview, with on-the-fly tuning.
 
 Uses the SAME CameraReader and detector as the flight code (no parallel pipeline), so
 what you see here is what happens in flight. Tuning changes live only in this process's
-MEMORY -- config.json is never modified.
+MEMORY -- suas/config.py is never modified.
 
 Run (from the repository root):
     python3 tools/preview.py                 # preview window + tuning keys
@@ -109,7 +109,7 @@ def main():
         return _camera_only(args.seconds, not args.no_display)
 
     if args.imgsz:
-        detector_module.IMGSZ = args.imgsz   # this process only; config.json is untouched
+        detector_module.IMGSZ = args.imgsz   # this process only; suas/config.py is untouched
         print(f">> full-frame imgsz set to {args.imgsz} (config unchanged)")
 
     show = not args.no_display

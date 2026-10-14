@@ -22,7 +22,7 @@ USAGE
 2) SOLVE (computes fx/fy/cx/cy + HFOV and writes calibration/result.json):
      python3 tools/calibrate_camera.py solve --cols 9 --rows 6 --square 25
 
-3) Copy the reported CAMERA_HFOV_DEG into config.json (section "camera").
+3) Copy the reported CAMERA_HFOV_DEG into suas/config.py.
 
 NOTE: --cols/--rows are INNER CORNER counts = (squares - 1) in each direction. A board
 with 10x7 squares is --cols 9 --rows 6. --square is the square edge in millimetres; it
@@ -197,7 +197,7 @@ def cmd_solve(args):
     print(f"  VFOV (vertical)    : {vfov:.2f} deg")
     print(f"  distortion (k1,k2,p1,p2,k3): {np.round(dist.ravel(), 4).tolist()}")
     print("-" * 60)
-    print('  >> For config.json ("camera"):  "CAMERA_HFOV_DEG": %.2f' % hfov)
+    print('  >> For suas/config.py:  CAMERA_HFOV_DEG = %.2f' % hfov)
     if abs(cx_off) > 3 or abs(cy_off) > 3:
         print("  ! The principal point is more than 3% off centre. The code assumes the")
         print("    image centre (W/2, H/2); if you need more accuracy, extend ibvs.py and")

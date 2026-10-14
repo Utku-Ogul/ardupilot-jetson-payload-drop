@@ -1,4 +1,4 @@
-"""MAVLink connection, companion heartbeat (GCS failsafe deadman) and preflight checks."""
+"""MAVLink connection, companion heartbeat and preflight checks."""
 import threading
 import time
 
@@ -11,10 +11,14 @@ from suas.utils.logger import get_logger
 log = get_logger("connection")
 
 # Liveness timestamps. The heartbeat daemon only emits a GCS heartbeat while BOTH are
-# fresh: the main loop (orchestration) AND the tracker (which commands velocity). That
-# way, if the TRACKER thread hangs while a live IBVS setpoint is in flight, the heartbeat
-# also stops -> the flight controller brakes on GUID_TIMEOUT, then RTLs on FS_GCS.
-# (Feeding it from main alone would not catch a tracker hang.)
+# fresh: the main loop (orchestration) AND the tracker (which commands velocity).
+#
+# GCS doctrine: the flight controller's SYSID_MYGCS is the GROUND STATION (Mission Planner,
+# sysid 255), so FS_GCS watches the ground link (SUAS 2026: 15 s comms loss -> RTL). This
+# companion heartbeat (sysid 254) is NOT the FS_GCS source; if the companion hangs in
+# GUIDED, the FC-side brake is GUID_TIMEOUT (setpoint dropped after <= 3 s -> stop and
+# hold, pilot takes over). The heartbeat gate is kept so the companion is honestly shown
+# as alive, and so the deadman semantics return if SYSID_MYGCS is ever set back to 254.
 _last_alive = [0.0]          # main loop liveness
 _last_alive_worker = [0.0]   # tracker (velocity-commanding) loop liveness
 _HB_STALE_S = 1.5
@@ -52,15 +56,16 @@ def _heartbeat_loop(mav):
 
 
 def start_companion_heartbeat(mav):
-    """Start the 1 Hz GCS heartbeat daemon that feeds the FC-side FS_GCS deadman.
+    """Start the 1 Hz companion heartbeat daemon (sysid 254).
 
-    The companion (sysid 254) must be distinct from the ground station (255) for this
-    to be a real deadman.
+    It is not the FS_GCS source (that is the ground station, 255), but the companion must
+    still use a sysid distinct from the ground station -- two GCSs with the same sysid
+    corrupt packet sequencing and routing.
     """
     mark_alive()
     mark_alive_worker()
     threading.Thread(target=_heartbeat_loop, args=(mav,), daemon=True).start()
-    log.info("Companion GCS heartbeat started (sysid=254, 1 Hz -- FS_GCS deadman)")
+    log.info("Companion GCS heartbeat started (sysid=254, 1 Hz; FS_GCS watches the ground station)")
 
 
 def connect(endpoint: str = None) -> mavutil.mavfile:
@@ -72,15 +77,14 @@ def connect(endpoint: str = None) -> mavutil.mavfile:
     if not endpoint:
         key = "MAVLINK_CONNECT_SIM" if SIM_MODE else "MAVLINK_CONNECT_REAL"
         raise SystemExit(
-            f"{key} is empty. Set it in config.json (section flight_controller), "
+            f"{key} is empty. Set it in suas/config.py, "
             f"or pass --connect.\n"
             "  Serial: run  ls -l /dev/serial/by-id/  and use the full by-id path\n"
             "          (usually the interface ending in -if00), not /dev/ttyACM0.\n"
             "  Network: use e.g. udpin:0.0.0.0:14550 or tcp:127.0.0.1:5760.")
     log.info("Connecting MAVLink: %s", endpoint)
     # Unique GCS identity (254), separate from vehicle (1) and ground station (255).
-    # Must match MAV_GCS_SYSID on the flight controller; this makes the companion its
-    # own deadman.
+    # The FC accepts its commands because SYSID_ENFORCE=0 (checked as CRITICAL in preflight).
     #
     # A USB/serial link can drop on brownout, cable movement or re-enumeration, so we
     # enable autoreconnect for serial devices. UDP (SITL) does not accept that kwarg
@@ -149,12 +153,13 @@ def _read_param(mav, name, timeout=1.5):
 def preflight_param_check(mav):
     """Read the FC safety parameters before flight.
 
-    Every mismatch is logged loudly. The CRITICAL set (fence / deadman / arming:
-    FENCE_ENABLE, GUID_TIMEOUT, MAV_GCS_SYSID == 254) is BLOCKING on a real vehicle:
-    if this returns False, main.py refuses to start the tracker. In SIM it only warns.
+    Every mismatch is logged loudly. The CRITICAL set (FENCE_ENABLE >= 1,
+    0 < GUID_TIMEOUT <= 3, SYSID_ENFORCE == 0) is BLOCKING on a real vehicle: if this
+    returns False, main.py refuses to start the tracker. In SIM it only warns.
+    SYSID_ENFORCE is critical because with 1 the FC only accepts commands from SYSID_MYGCS
+    (the ground station), silently rejecting the companion's GUIDED/goto/velocity commands.
 
-    Returns: crit_ok (bool). The single most important check is MAV_GCS_SYSID == 254 --
-    without it the companion FS_GCS deadman never works.
+    Returns: crit_ok (bool).
 
     NOTE: an unreadable critical parameter also blocks. On a healthy USB link these read
     reliably at startup; if they do not, there is a link or parameter problem and staying
@@ -169,7 +174,7 @@ def preflight_param_check(mav):
                 "SIMULATION" if SIM_MODE else "REAL VEHICLE")
     log.warning("Camera source: %s", CAMERA_RTSP_URL)
     if SIM_MODE:
-        log.warning('!! SIM_MODE=True -- set "SIM_MODE": false in config.json for real flight !!')
+        log.warning('!! SIM_MODE=True -- set SIM_MODE = False in suas/config.py for real flight !!')
         log.warning("   (While True: flyaway/divergence aborts continue instead of parking,")
         log.warning("    the gimbal-nadir safety gate is skipped, camera uses the sim URL.)")
     elif GPIO_ENABLED and PAYLOAD_ENABLED:
@@ -186,15 +191,17 @@ def preflight_param_check(mav):
     ok_all = True
     crit_ok = True
     # (parameter, predicate, expected description, CRITICAL?)
-    # 'critical' entries are BLOCKING on a real vehicle (companion deadman + fence + arming
-    # core). The rest (batt/ekf/vibe/angle) are loud warnings only.
+    # 'critical' entries are BLOCKING on a real vehicle (fence + GUIDED timeout + companion
+    # command authority). The rest (batt/ekf/vibe/angle) are loud warnings only.
     checks = (
         ("FENCE_ENABLE", lambda v: v >= 1, ">=1", True),
         ("GUID_TIMEOUT", lambda v: 0 < v <= 3, "0 < v <= 3s", True),
-        # Non-blocking by choice: with FS_GCS_ENABLE=0 a companion dropout leaves the
-        # vehicle hovering (via GUID_TIMEOUT) instead of triggering RTL. Set to True below
-        # if you want RTL enforced.
+        ("SYSID_ENFORCE", lambda v: int(round(v)) == 0,
+         "== 0 (otherwise the companion's commands are rejected)", True),
+        # Ground-link failsafe: Mission Planner heartbeat lost for FS_GCS_TIMEOUT -> RTL.
         ("FS_GCS_ENABLE", lambda v: v >= 1, ">=1", False),
+        ("FS_OPTIONS", lambda v: not (int(round(v)) & 2),
+         "bit 1 (=2) OFF: RTL on GCS loss in AUTO too", False),
         ("ARMING_CHECK", lambda v: int(round(v)) != 0, "!= 0", False),
         ("ANGLE_MAX", lambda v: v <= 3000, "<=3000 cdeg (30 deg)", False),
         ("FS_EKF_ACTION", lambda v: v >= 1, ">=1", False),
@@ -217,21 +224,27 @@ def preflight_param_check(mav):
             if crit:
                 crit_ok = False
 
-    gcs = _read_param(mav, "MAV_GCS_SYSID")
+    # GCS identity: expected 255 = the ground station, so FS_GCS watches the ground link.
+    # Warns only -- command authority is checked separately via SYSID_ENFORCE.
+    gcs = _read_param(mav, "SYSID_MYGCS")        # ArduCopter <= 4.6 name
     if gcs is None:
-        gcs = _read_param(mav, "SYSID_MYGCS")   # parameter name on firmware < 4.5
+        gcs = _read_param(mav, "MAV_GCS_SYSID")  # newer firmware name
     if gcs is None:
-        log.warning("PREFLIGHT: could not read MAV_GCS_SYSID/SYSID_MYGCS -- verify it is 254")
+        log.warning("PREFLIGHT: could not read SYSID_MYGCS/MAV_GCS_SYSID -- verify it is 255 "
+                    "(ground station)")
         ok_all = False
-        crit_ok = False
-    elif int(round(gcs)) != 254:
-        log.warning("PREFLIGHT WARNING: GCS_SYSID=%d != 254 -> the companion FS_GCS deadman "
-                    "will NOT work", int(round(gcs)))
+    elif int(round(gcs)) == 254:
+        log.warning("PREFLIGHT WARNING: GCS_SYSID=254 (= this companion) -> FS_GCS watches the "
+                    "companion, not the ground station. A companion restart or a long prompt "
+                    "while armed will trigger the GCS failsafe. Expected 255.")
         ok_all = False
-        crit_ok = False
+    elif int(round(gcs)) != 255:
+        log.warning("PREFLIGHT WARNING: GCS_SYSID=%d != 255 -> FS_GCS is NOT watching the "
+                    "ground station", int(round(gcs)))
+        ok_all = False
 
     if ok_all:
-        log.info("PREFLIGHT: FC safety parameters OK (fence/deadman/arming/batt/ekf/vibe)")
+        log.info("PREFLIGHT: FC safety parameters OK (fence/guid-timeout/sysid/fs_gcs/arming/batt/ekf/vibe)")
     elif not crit_ok and not SIM_MODE:
         log.warning("PREFLIGHT: critical parameter(s) wrong or unreadable -> real flight is "
                     "BLOCKED (see main.py).")

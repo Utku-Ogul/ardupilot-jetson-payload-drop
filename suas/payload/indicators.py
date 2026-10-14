@@ -17,7 +17,7 @@ from suas.utils.logger import get_logger
 
 log = get_logger("gpio")
 
-# Pin numbers use BOARD (physical) numbering and come from config.json.
+# Pin numbers use BOARD (physical) numbering and come from suas/config.py.
 _ALL_PINS = [BUZZER_PIN, LED_STATUS_PIN, *AUX_PINS]
 
 _enabled = GPIO_ENABLED

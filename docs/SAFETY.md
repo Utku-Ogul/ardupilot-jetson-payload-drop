@@ -24,23 +24,27 @@ nonsense, layers B and C still bound the aircraft. This is why
 
 ---
 
-## The companion deadman
+## Companion heartbeat and the GCS failsafe
 
-The companion sends a 1 Hz GCS heartbeat as system id **254**, which feeds the flight
-controller's `FS_GCS` failsafe.
+The flight controller's `SYSID_MYGCS` is the **ground station** (Mission Planner, system id
+255), so `FS_GCS` watches the ground link: if its heartbeat is lost for `FS_GCS_TIMEOUT`
+(15 s, SUAS 2026 Appendix B) the vehicle returns to launch in every mode (`FS_OPTIONS=0`).
+RC loss is handled separately by `FS_THR_ENABLE`, and 90 s of comms loss terminates the
+flight via [`lua/comms_loss_termination.lua`](../lua/README.md).
 
-The heartbeat is emitted **only while BOTH loops are alive**:
+The companion still sends a 1 Hz heartbeat as system id **254** (distinct from the ground
+station), but it is **not** the `FS_GCS` source. If the companion hangs or crashes in
+GUIDED, the flight-controller-side brake is `GUID_TIMEOUT`: the velocity setpoint is
+dropped after at most 3 s and the vehicle stops and holds; the pilot takes over.
 
-- the main loop (`mark_alive()`), and
-- the tracker loop (`mark_alive_worker()`), which is the one that commands velocity.
+The heartbeat is emitted only while BOTH loops are alive -- the main loop (`mark_alive()`)
+and the velocity-commanding tracker loop (`mark_alive_worker()`) -- so the companion is
+only reported alive when it really is, and the deadman semantics return if `SYSID_MYGCS`
+is ever set back to 254.
 
-That second condition matters: if the tracker thread hangs while a live IBVS velocity
-setpoint is in flight, the heartbeat stops too. The flight controller then brakes on
-`GUID_TIMEOUT` and escalates to `FS_GCS`. Feeding the heartbeat from the main loop alone
-would not catch a hung tracker.
-
-`MAV_GCS_SYSID` on the flight controller **must** be 254, or this deadman does nothing at
-all. Preflight blocks the flight if it is not.
+The companion's commands are accepted because `SYSID_ENFORCE=0`. With `1` the flight
+controller only obeys the ground station and silently rejects every GUIDED, goto and
+velocity command from the companion -- so preflight treats it as critical.
 
 ---
 
@@ -54,19 +58,19 @@ Critical (blocking):
 
 - `FENCE_ENABLE >= 1`
 - `0 < GUID_TIMEOUT <= 3`
-- `MAV_GCS_SYSID == 254`
+- `SYSID_ENFORCE == 0`
 
 An unreadable parameter also blocks. On a healthy link these read reliably at startup; if
 they do not, there is a link or configuration problem, and staying on the ground is the
 correct outcome.
 
-Warnings only (loud, non-blocking): `FS_GCS_ENABLE`, `ARMING_CHECK`, `ANGLE_MAX`,
-`FS_EKF_ACTION`, `FS_THR_ENABLE`, `FS_VIBE_ENABLE`, `BATT_MONITOR`, `BATT_FS_LOW_ACT`.
+Warnings only (loud, non-blocking): `FS_GCS_ENABLE`, `FS_OPTIONS` (bit 1 must be off),
+`ARMING_CHECK`, `ANGLE_MAX`, `FS_EKF_ACTION`, `FS_THR_ENABLE`, `FS_VIBE_ENABLE`,
+`BATT_MONITOR`, `BATT_FS_LOW_ACT`, and `SYSID_MYGCS` (expected 255; 254 means `FS_GCS`
+would watch the companion instead of the ground station).
 
-> Two of these are non-blocking by choice and you may want to change that. With
-> `FS_GCS_ENABLE = 0` a companion dropout leaves the vehicle hovering via `GUID_TIMEOUT`
-> rather than triggering RTL. With `ARMING_CHECK = 0` the vehicle will arm without its
-> normal pre-arm validation. Both are one-line changes in
+> `ARMING_CHECK = 0` lets the vehicle arm without its normal pre-arm validation. It is a
+> warning rather than a block by choice; making it blocking is a one-line change in
 > `suas/vehicle/connection.py::preflight_param_check`.
 
 ---

@@ -13,10 +13,10 @@ preview_out/
 calibration/
 *.log
 
-# Model artefacts
-# best.pt is tracked (see models/README.md). A TensorRT engine is specific to the
-# JetPack/CUDA/GPU it was built on and must NEVER be committed -- build it on the target
-# with tools/export_tensorrt.py.
+# Model artefacts -- weights are NOT tracked (see models/README.md); copy them onto the
+# Jetson by hand. A TensorRT engine is specific to the JetPack/CUDA/GPU it was built on and
+# must NEVER be committed -- build it on the target with tools/export_tensorrt.py.
+models/*.pt
 models/*.engine
 models/*.onnx
 

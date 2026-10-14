@@ -11,8 +11,9 @@ directory and stdin=DEVNULL that the tracker uses in flight. What you see here i
 happens in flight -- except that the output goes to your terminal instead of a log file.
 
 Target mapping (single source of truth: drop_sequence.TARGETS):
-    mannequin -> servo 1 (pin 7)  + motor B (pins 29/31),  90 -> 30 deg
-    tent      -> servo 2 (pin 12) + motor A (pins 32/33),  90 -> 150 deg
+    mannequin -> servo on pin 12 + motor B (pins 29/31),  90 -> 10 deg
+    tent      -> servo on pin 7  + motor A (pins 32/33),  90 -> 10 deg
+(as shipped -- the actual mapping is PAYLOAD_TARGETS in suas/config.py)
 
 SAFETY
     * Every actuation prints exactly what will happen and requires confirmation.

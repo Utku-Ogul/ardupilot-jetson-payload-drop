@@ -8,7 +8,7 @@ Options:
   --connect STR       MAVLink connection string (default: config.MAVLINK_CONNECT)
   --no-mapping        Disable waypoint photo capture
   --no-display        Do not open the camera preview window (headless / SSH)
-  --photo-start-wp N  Start photographing at this waypoint sequence
+  --photo-start-wp N  Mapping start sequence: photo capture AND target recording start here
   --no-ask-mapping    Skip the interactive pre-flight mapping prompt
 """
 import argparse
@@ -17,7 +17,7 @@ import sys
 import time
 
 from suas.config import (MAVLINK_CONNECT, SHUTDOWN_SAFE_MODE, SIM_MODE,
-                         GIMBAL_MANUAL_NADIR)
+                         GIMBAL_MANUAL_NADIR, PHOTO_START_WP)
 from suas.detection.camera import CameraReader
 from suas.mission import MissionWatcher
 from suas.payload import indicators
@@ -32,15 +32,18 @@ log = get_logger("main")
 
 
 def _setup_mapping_start(mission, default_start: int, ask: bool) -> int:
-    """Interactive PRE-FLIGHT selection of where photo capture begins.
+    """Interactive PRE-FLIGHT selection of where mapping begins.
 
     Flow:
       1. The operator uploads the mission from the ground station.
       2. Pressing Enter downloads the mission and lists it.
-      3. The operator enters the sequence number to start photographing from.
+      3. The operator enters the mapping start sequence. From that item on, photos are
+         taken AND the tracker records mannequin/tent candidates. Before it (takeoff,
+         waypoint lap, transit) the detector runs but nothing is recorded.
 
-    If ask is False, or the terminal is not interactive (SSH/headless, no TTY), this
-    prompts for nothing and returns default_start.
+    If ask is False (--no-ask-mapping), or there is no terminal (e.g. a systemd service),
+    this prompts for nothing and returns default_start. An SSH session has a terminal, so
+    the prompt also appears with --no-display.
     """
     if not ask or not sys.stdin.isatty():
         if not sys.stdin.isatty():
@@ -71,6 +74,7 @@ def _setup_mapping_start(mission, default_start: int, ask: bool) -> int:
     print()
     print(mission.describe())
     print("[WP] = NAV_WAYPOINT (photo point) | <- LAST = end of mission")
+    print("Choose the FIRST MAPPING waypoint (not the lap): nothing before it is recorded.")
     first_wp = mission.first_waypoint_seq()
     print()
 
@@ -91,7 +95,8 @@ def _setup_mapping_start(mission, default_start: int, ask: bool) -> int:
         print("! Enter a valid number (e.g. 7).")
 
     n_photo = sum(1 for s in (mission.wp_seqs or []) if s >= chosen)
-    print(f"OK: mapping from seq>={chosen} -> {n_photo} NAV_WAYPOINT(s) will be photographed.")
+    print(f"OK: mapping from seq>={chosen} -> {n_photo} NAV_WAYPOINT(s) will be photographed; "
+          f"target recording starts when seq {chosen} is reached.")
     print("----------------------------------------------------------------------")
     print()
     return chosen
@@ -106,7 +111,8 @@ def main():
     ap.add_argument("--no-display", action="store_true",
                     help="do not open the camera preview window")
     ap.add_argument("--photo-start-wp", type=int, default=None,
-                    help="waypoint sequence to start photographing from (skips the prompt)")
+                    help="mapping start sequence: photo capture AND target recording "
+                         "start here (skips the prompt)")
     ap.add_argument("--no-ask-mapping", action="store_true",
                     help="skip the interactive pre-flight mapping-start prompt")
     args = ap.parse_args()
@@ -122,7 +128,7 @@ def main():
     if not SIM_MODE and not crit_ok:
         log.error("=" * 64)
         log.error("REAL FLIGHT BLOCKED -- critical flight-controller safety parameter(s) wrong.")
-        log.error("Verify FENCE_ENABLE / GUID_TIMEOUT / MAV_GCS_SYSID=254 (see docs/SAFETY.md).")
+        log.error("Verify FENCE_ENABLE>=1 / 0<GUID_TIMEOUT<=3 / SYSID_ENFORCE=0 (see docs/SAFETY.md).")
         log.error("The companion will NOT start.")
         log.error("=" * 64)
         sys.exit(2)      # stay on the ground: no flight without fence/deadman/arming checks
@@ -155,31 +161,37 @@ def main():
                         "START. Configure and verify the gimbal driver and its attitude stream "
                         "before flight.", pose.pose.gimbal_pitch_deg)
 
-    start_companion_heartbeat(mav)       # feed the FC-side FS_GCS deadman (sysid 254, 1 Hz)
+    start_companion_heartbeat(mav)       # 1 Hz companion heartbeat (sysid 254; not the FS_GCS source)
     cam = CameraReader()
 
     # Watches the mission: downloads it, exposes waypoint sequences and completion.
     mission = MissionWatcher(mav, pose)
 
+    # Mapping start. Precedence: --photo-start-wp (explicit) > interactive prompt > config.
+    # The same sequence starts photo capture AND the tracker's target recording (the
+    # recording gate also applies with --no-mapping).
+    if args.photo_start_wp is not None:
+        start_wp = args.photo_start_wp
+        log.info("Mapping start (CLI): WP seq>=%d", start_wp)
+    else:
+        # Asked whenever there is a terminal -- also with --no-display (SSH is headless but
+        # interactive). Skipping it would silently fall back to PHOTO_START_WP.
+        start_wp = _setup_mapping_start(mission, PHOTO_START_WP, not args.no_ask_mapping)
+        log.info("Mapping start: WP seq>=%d", start_wp)
+    if start_wp <= 0:
+        log.warning("Mapping start is 0 -> targets are recorded from the START of AUTO, including "
+                    "takeoff, the waypoint lap and transit. Pass --photo-start-wp N (the first "
+                    "mapping waypoint) unless that is intended.")
+
     photo = None
     if not args.no_mapping:
-        from suas.config import PHOTO_START_WP
         from suas.mapping.photo import PhotoCapture
-
-        # Precedence: --photo-start-wp (explicit) > interactive prompt > config default
-        if args.photo_start_wp is not None:
-            start_wp = args.photo_start_wp
-            log.info("Mapping start (CLI): WP seq>=%d", start_wp)
-        else:
-            ask = (not args.no_ask_mapping) and (not args.no_display)
-            start_wp = _setup_mapping_start(mission, PHOTO_START_WP, ask)
-            log.info("Mapping start: WP seq>=%d", start_wp)
-
         photo = PhotoCapture(mav, pose, cam, mission, start_wp=start_wp)
         log.info("Mapping module active")
 
     # Start the tracker AFTER the interactive setup, so it does not log over the prompts.
-    tracker = SuasTracker(mav, pose, cam, show_window=not args.no_display)
+    tracker = SuasTracker(mav, pose, cam, show_window=not args.no_display,
+                          record_start_wp=start_wp)
     tracker.start()
 
     # Shutdown: NEUTRALISE the vehicle (leave no live setpoint), park it safely, clean up.

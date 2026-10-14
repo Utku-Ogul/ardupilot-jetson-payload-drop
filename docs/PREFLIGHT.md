@@ -9,16 +9,15 @@ Read [SAFETY.md](SAFETY.md) first.
 ## Stage 0 — Desk (no hardware)
 
 ```bash
-python3 -m unittest discover -s tests   # geometry conventions
-python3 tools/show_config.py            # your settings, and a consistency check
+python3 -m unittest discover -s tests   # geometry conventions + configuration consistency
 ```
 
 The geometry tests lock the pixel→GPS axis convention. A failure here means saved target
 positions will be wrong, so fix it before anything else.
 
-`show_config.py` reports typos in `config.json` (an unrecognised key is *ignored*, which is
-dangerous for a safety setting), missing files, GPIO pin collisions and inconsistent
-thresholds. Fix every ERROR before continuing.
+`tests/test_config.py` checks `suas/config.py` for GPIO pin collisions, a hold time
+shorter than the payload sequence and inconsistent thresholds. Fix every failure before
+continuing.
 
 ---
 
@@ -60,7 +59,7 @@ python3 tools/preview.py
 - [ ] Live image, sensible frame rate
 - [ ] Targets are detected at your intended operating altitude
 - [ ] Class labels are correct (a mannequin is not reported as a tent)
-- [ ] Tune `DETECT_CONF` with `+`/`-` and copy the value you settle on into `config.json`
+- [ ] Tune `DETECT_CONF` with `+`/`-` and copy the value you settle on into `suas/config.py`
 
 If small targets are missed, try `f` to raise the image size, or enable
 `TILING_IN_SURVEY` — but check the frame rate, since tiling is CPU-bound.
@@ -88,14 +87,14 @@ python3 tools/payload_test.py
 - [ ] Ctrl+C during the motor run stops it immediately
 - [ ] Killing the parent process stops the motor (deadman)
 
-Adjust pins, angles and timings in `config.json` under `payload_hardware`, then re-run
-`python3 tools/show_config.py --check` to confirm there are no pin collisions.
+Adjust pins, angles and timings in `suas/config.py`, then re-run
+`python3 -m unittest discover -s tests -p test_config.py` to confirm there are no pin collisions.
 
 ---
 
 ## Stage 4 — Simulation
 
-Set `"SIM_MODE": true` in `config.json`, then:
+Set `SIM_MODE = True` in `suas/config.py`, then:
 
 ```bash
 ./sim/start_sim.sh
@@ -125,7 +124,7 @@ An inverted sign drives the aircraft *away* from the target until a watchdog sto
 
 ## Stage 5 — Field, payload DISARMED
 
-`"GPIO_ENABLED": false`, `"PAYLOAD_ENABLED": false` in `config.json`. Pilot on the sticks,
+`GPIO_ENABLED = False`, `PAYLOAD_ENABLED = False` in `suas/config.py`. Pilot on the sticks,
 mode switch ready.
 
 Build up in this order, aborting to a manual mode at any surprise:
@@ -134,8 +133,9 @@ Build up in this order, aborting to a manual mode at any surprise:
 2. [ ] **Goto response** — the vehicle actually flies to a commanded position
 3. [ ] **Body-frame axes** — a small manual velocity nudge moves it the expected way
 4. [ ] **IBVS signs on the real airframe** — `g_err` decreases
-5. [ ] **Deadman** — kill the companion process in flight; confirm the flight controller
-       brakes (`GUID_TIMEOUT`) and then acts on `FS_GCS`
+5. [ ] **Companion loss** — kill the companion process in GUIDED; confirm the flight
+       controller stops and holds within 3 s (`GUID_TIMEOUT`). Separately, disconnect the
+       ground station and confirm RTL after 15 s (`FS_GCS`)
 6. [ ] **Abort** — a pilot mode change immediately parks the state machine
 
 Then a full end-to-end mission with the payload still disarmed:
@@ -150,10 +150,10 @@ Then a full end-to-end mission with the payload still disarmed:
 
 **Only after every stage above has passed.**
 
-- [ ] `"GPIO_ENABLED": true`
-- [ ] `"PAYLOAD_ENABLED": true`
-- [ ] `"SIM_MODE": false` — confirm it in the startup banner
-- [ ] `python3 tools/show_config.py --check` passes
+- [ ] `GPIO_ENABLED = True`
+- [ ] `PAYLOAD_ENABLED = True`
+- [ ] `SIM_MODE = False` — confirm it in the startup banner
+- [ ] `python3 -m unittest discover -s tests` passes
 - [ ] The startup banner shows the "PAYLOAD ARMED" warning
 - [ ] Payload physically loaded and secured
 - [ ] Drop zone clear of people
@@ -162,7 +162,7 @@ Then a full end-to-end mission with the payload still disarmed:
 
 ## Every flight
 
-- [ ] `python3 tools/show_config.py --check` clean
+- [ ] `python3 -m unittest discover -s tests` clean
 - [ ] `SIM_MODE` correct (check the startup banner)
 - [ ] Mission uploaded, ending in `NAV_LOITER_UNLIM`
 - [ ] Gimbal pointing down and confirmed on video (if `GIMBAL_MANUAL_NADIR`)

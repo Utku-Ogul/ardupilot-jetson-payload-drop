@@ -73,21 +73,16 @@ once your user is in the `gpio` group.
 
 ## 4. Configuration
 
-**All settings live in `config.json` in the repository root. Do not edit the Python.**
-
-`suas/config.py` holds the defaults and the reasoning behind each one; `config.json`
-overrides them. A key that is absent or `null` keeps its default.
+**All settings live in `suas/config.py`.** Each value carries the reasoning behind it.
 
 After every edit:
 
 ```bash
-python3 tools/show_config.py            # what resolved, and from where
-python3 tools/show_config.py --changed  # only your overrides
-python3 tools/show_config.py --check    # validation only
+python3 -m unittest discover -s tests -p test_config.py -v
 ```
 
-An **unrecognised key is reported as an error**, not silently ignored — a misspelled
-safety setting that quietly kept its default is exactly the failure this cannot afford.
+This catches pin collisions, a hold time shorter than the payload sequence, misaligned
+altitude envelopes and confidence thresholds that would block a release.
 
 Full reference: [CONFIGURATION.md](CONFIGURATION.md).
 
@@ -108,8 +103,8 @@ for itself — pick free addresses on that subnet:
 | Camera | inside `CAMERA_RTSP_URL_REAL` |
 | Ground station PC | `STREAM_HOST` (falls back to `GROUND_STATION_IP`) |
 
-`COMPANION_IP`, `GROUND_STATION_IP` and `SIM_HOST_IP` live in `config.json` (section
-`network`) and ship blank. Only the camera URL and the stream host are read by the code;
+`COMPANION_IP`, `GROUND_STATION_IP` and `SIM_HOST_IP` live in `suas/config.py` (set to the
+SIYI HM30 subnet we flew on). Only the camera URL and the stream host are read by the code;
 the rest are there so your whole setup is recorded in one place.
 
 Check reachability before flying:
@@ -123,19 +118,17 @@ ffplay rtsp://<camera-ip>:8554/main.264
 
 ## 6. Camera
 
-Set the stream URL and optics in `config.json` (section `camera`):
+Set the stream URL and optics in `suas/config.py` (camera section):
 
-```json
-"camera": {
-  "CAMERA_MODE": "rtsp",
-  "CAMERA_RTSP_URL_REAL": "rtsp://<camera-ip>:8554/main.264",
-  "CAMERA_WIDTH": 1920,
-  "CAMERA_HEIGHT": 1080,
-  "CAMERA_HFOV_DEG": 81.0
-}
+```python
+CAMERA_MODE = "rtsp"
+CAMERA_RTSP_URL_REAL = "rtsp://<camera-ip>:8554/main.264"
+CAMERA_WIDTH = 1920
+CAMERA_HEIGHT = 1080
+CAMERA_HFOV_DEG = 81.0
 ```
 
-Use `"CAMERA_MODE": "udp"` for an RTP/JPEG source instead of RTSP. Measure
+Use `CAMERA_MODE = "udp"` for an RTP/JPEG source instead of RTSP. Measure
 `CAMERA_HFOV_DEG` rather than trusting the spec — see below.
 
 Verify frames arrive:
@@ -148,7 +141,7 @@ python3 tools/preview.py                 # with detection
 ### Field of view
 
 `CAMERA_HFOV_DEG` drives both `IBVS_FX` and `pixel_to_gps`. The manufacturer spec is a
-starting point; a 10% error becomes metres of geolocation error at 20 m altitude.
+starting point; a 10% error becomes metres of geolocation error at a 50 m survey altitude.
 
 ```bash
 python3 tools/calibrate_camera.py capture --cols 9 --rows 6
@@ -178,8 +171,8 @@ Default pin map (BOARD / physical numbering):
 | Spare outputs | 16, 18 |
 | Common ground | 6 |
 
-Change them in `config.json` under `payload_hardware` — no code edits needed.
-`python3 tools/show_config.py --check` detects pin collisions.
+Change them in `suas/config.py` (`PAYLOAD_TARGETS`, `MOTOR_*_PINS`, `BUZZER_PIN`, ...).
+`tests/test_config.py` detects pin collisions.
 
 **Power.** Hobby servos need 5 V from a separate supply with a common ground — do not run
 them from the 3.3 V rail. Motor supply goes to the driver board, not through the companion.
@@ -226,7 +219,7 @@ After=network-online.target
 Type=simple
 User=YOUR_USER
 WorkingDirectory=/home/YOUR_USER/suas
-ExecStart=/home/YOUR_USER/suas/run.sh --no-display --no-ask-mapping
+ExecStart=/home/YOUR_USER/suas/run.sh --no-display --photo-start-wp 4   # first MAPPING waypoint of your mission
 Restart=on-failure
 RestartSec=5
 

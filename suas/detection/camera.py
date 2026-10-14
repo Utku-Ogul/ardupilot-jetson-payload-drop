@@ -27,7 +27,7 @@ class CameraReader:
         if CAMERA_MODE == "rtsp" and not CAMERA_RTSP_URL:
             raise RuntimeError(
                 "The camera stream URL is empty. Set CAMERA_RTSP_URL_REAL (or "
-                "CAMERA_RTSP_URL_SIM) in config.json, section camera -- "
+                "CAMERA_RTSP_URL_SIM) in suas/config.py -- "
                 "e.g. rtsp://<camera-ip>:8554/main.264")
         cap = self._open()
         if not cap.isOpened():

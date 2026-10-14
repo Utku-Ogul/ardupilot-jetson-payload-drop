@@ -10,21 +10,19 @@ detector actually sees, which is what you want while debugging a mission.
 
 ## 1. Enable it
 
-In `config.json` (section `streaming`):
+In `suas/config.py` (streaming section):
 
-```json
-"streaming": {
-  "STREAM_ENABLED": true,
-  "STREAM_HOST": "<ground-station-ip>",
-  "STREAM_PORT": 5600,
-  "STREAM_WIDTH": 960,
-  "STREAM_HEIGHT": 540,
-  "STREAM_BITRATE": 2000000
-}
+```python
+STREAM_ENABLED = True
+STREAM_HOST = "<ground-station-ip>"   # defaults to GROUND_STATION_IP
+STREAM_PORT = 5600
+STREAM_WIDTH = 960
+STREAM_HEIGHT = 540
+STREAM_BITRATE = 2_000_000
 ```
 
 `STREAM_HOST` is your ground station's IP; port 5600 is the QGroundControl and Mission
-Planner default. Verify with `python3 tools/show_config.py --changed`.
+Planner default.
 
 Then launch through **`run.sh`**. Streaming needs the GStreamer-enabled OpenCV; under a
 bare `python3` it disables itself silently (flight is unaffected) and logs one warning.
@@ -120,7 +118,7 @@ gst-launch-1.0 videotestsrc is-live=true \
 ```
 
 A colour test pattern on the ground station means the path works. Then set
-`"STREAM_ENABLED": true` in `config.json` and use the real stream.
+`STREAM_ENABLED = True` in `suas/config.py` and use the real stream.
 
 ---
 

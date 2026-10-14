@@ -19,7 +19,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from suas.config import (MODEL_PATH, MODEL_ENGINE_PATH, USE_TENSORRT,
+from suas.config import (MODEL_PATH, MODEL_ENGINE_PATH, USE_TENSORRT, ENGINE_BATCH,
                          TILE_SIZE, IMGSZ, TILE_OVERLAP, DETECT_CONF, NMS_IOU,
                          TILE_ADD_FULL_FRAME, TILING_IN_SURVEY, CLASS_NAMES)
 from suas.detection.base import BaseDetector, Detection
@@ -73,12 +73,13 @@ class TiledYoloDetector(BaseDetector):
             )
 
         self._model = YOLO(path)
-        # A fixed-batch TensorRT engine expects exactly this many crops (it is not
-        # dynamic). Survey tiling produces 9 crops at 1080p; IBVS produces 1, so _raw()
-        # pads up to _engine_batch. This must match the batch used by tools/export_tensorrt.py.
+        # A fixed-batch TensorRT engine expects exactly ENGINE_BATCH crops (it is not
+        # dynamic): 1 with tiling off, 9 with 1080p tiling on. tools/export_tensorrt.py reads
+        # the same setting, so the engine and the code cannot silently disagree.
         # The .pt path accepts any batch size and is never padded.
         self._is_engine = (path == MODEL_ENGINE_PATH)
-        self._engine_batch = 9
+        self._engine_batch = max(1, int(ENGINE_BATCH))
+        self._batch_warned = False
         self._names = self._model.names          # {0: 'mannequin', 1: 'tent'}
         # All class logic downstream (clustering, per-class targets, IBVS same-class
         # selection, the payload identity gate) keys off the label STRING. If a retrained
@@ -132,6 +133,15 @@ class TiledYoloDetector(BaseDetector):
             if len(crops) < self._engine_batch:
                 pred_crops = crops + [crops[-1]] * (self._engine_batch - len(crops))
             else:
+                # OVERFLOW: the engine batch is smaller than the crop count, so the cut tiles
+                # are never searched (silent recall loss). Fail loud, once.
+                if not self._batch_warned:
+                    self._batch_warned = True
+                    log.warning("ENGINE BATCH MISMATCH: %d crops per frame but engine batch=%d "
+                                "-> %d tile(s) NOT searched. Set ENGINE_BATCH=%d and rebuild the "
+                                "engine (tools/export_tensorrt.py), or disable tiling.",
+                                len(crops), self._engine_batch,
+                                len(crops) - self._engine_batch, len(crops))
                 pred_crops = crops[:self._engine_batch]
         imgsz = TILE_SIZE if self.tiling else IMGSZ
         res = self._model.predict(pred_crops, imgsz=imgsz, conf=DETECT_CONF,

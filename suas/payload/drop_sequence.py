@@ -4,7 +4,7 @@ Target-selective payload drop sequence: 2 servos + a dual H-bridge driving 2 mot
 
 The tracker (suas/tracker.py) launches this as a SEPARATE process once a target has been
 centred and every safety gate has passed. The target class selects which servo and motor
-are used, per the `payload_hardware` section of config.json:
+are used, per PAYLOAD_TARGETS in suas/config.py:
 
     --target <class>  ->  that class's servo moves neutral -> release angle,
                           then its motor runs forward at full power
@@ -13,7 +13,7 @@ are used, per the `payload_hardware` section of config.json:
     --reverse         ->  temporarily invert the motor direction (if the wiring is reversed)
 
 The release angle is per target; the neutral start angle is shared. Every pin, angle and
-timing comes from config.json -- do not hard-code them here.
+timing comes from suas/config.py -- do not hard-code them here.
 
 Running it as its own process is deliberate:
   * Its GPIO.setmode/cleanup cannot disturb the indicator pins owned by the main process.
@@ -60,7 +60,7 @@ except ImportError:                                  # pragma: no cover - hardwa
     GPIO_AVAILABLE = False
 
 # --------------------------------------------------------------------- #
-# All pins, angles and timings come from config.json (payload_hardware).
+# All pins, angles and timings come from suas/config.py.
 # Edit that file, not this one.
 # --------------------------------------------------------------------- #
 from suas.config import (MOTOR_A_PINS, MOTOR_B_PINS,  # noqa: E402
@@ -70,7 +70,7 @@ from suas.config import (MOTOR_A_PINS, MOTOR_B_PINS,  # noqa: E402
                          SERVO_STEP_DT, WAIT_AFTER_SERVO, WAIT_BEFORE_SERVO)
 
 # Target -> servo pin, motor channel, release angle, motor direction, display name.
-# The display name is derived so config.json does not have to carry it.
+# The display name is derived so the config does not have to carry it.
 TARGETS = {
     key: {**spec, "name": spec.get("name", key.upper())}
     for key, spec in PAYLOAD_TARGETS.items()
@@ -275,7 +275,7 @@ def _run_drop(spec, reverse):
 
 def main():
     ap = argparse.ArgumentParser(description="Target-selective payload drop sequence")
-    # The choices and the help text are derived from config.json, so changing the target
+    # The choices and the help text are derived from the config, so changing the target
     # classes never leaves this out of date.
     target_help = "; ".join(
         f"{k} -> servo pin {v['servo_pin']} + motor {v['motor']}"

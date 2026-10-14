@@ -3,7 +3,10 @@ Mission state machine.
 
 States:
   WAITING_AUTO  -> waiting for the vehicle to enter AUTO
-  MONITORING    -> surveying; detections are clustered into candidates
+  MONITORING    -> surveying; detections are clustered into candidates. The detector runs
+                   from takeoff, but RECORDING (candidate sampling) only starts once the
+                   mission reaches the mapping start item (record_start_wp), so targets
+                   seen during takeoff, the waypoint lap or transit are not recorded.
   TARGET_SAVED  -> a target position is saved; waiting for the mission to finish
   GPS_GOTO      -> flying to the target's GPS position in GUIDED
   IBVS_ACTIVE   -> visual servoing to centre on the target
@@ -23,16 +26,18 @@ from typing import Optional
 
 import cv2
 
-from suas.config import (ACQUIRE_MAX_SAMPLES, ACQUIRE_MIN_SAMPLES, ACQUIRE_REFINE,
+from suas.config import (ACQUIRE_MAX_SAMPLES, ACQUIRE_MAX_SPEED, ACQUIRE_MIN_SAMPLES,
+                         ACQUIRE_REFINE,
                          ACQUIRE_TILT_GATE, ACQUIRE_TILT_MAX_DEG,
                          AFTER_VISIT_ACTION, CAMERA_HEIGHT, CAMERA_WIDTH,
                          CANDIDATE_MIN_CONF, DETECT_CONFIRM_SEC, DETECT_LOST_GRACE,
                          FIRE_MIN_CONF, FIRE_SETTLE_MAX_S, FIRE_SETTLE_MIN_S,
-                         GOTO_MIN_ALT_M, GOTO_RADIUS_M, GOTO_TIMEOUT_S,
+                         GOTO_MIN_ALT_M, GOTO_RADIUS_M, GOTO_SETTLE_MAX_SPEED,
+                         GOTO_TIMEOUT_S,
                          GPIO_ENABLED, GPS_DROP_FALLBACK, GPS_DROP_FIRE_RADIUS_M,
                          GPS_DROP_MAX_SPEED, GPS_DROP_SETTLE_MAX_S, GPS_SETTLE_SEC,
-                         IBVS_ALT_MAX, IBVS_ALT_MIN, IBVS_CENTER_TOL_M,
-                         IBVS_CENTER_TOL_MAX_M, IBVS_CENTER_TOL_STEP_M,
+                         IBVS_ALT_MAX, IBVS_ALT_MIN, IBVS_CENTER_TOL_ATTEMPTS_TOTAL,
+                         IBVS_CENTER_TOL_LADDER, IBVS_CENTER_TOL_M,
                          IBVS_DIVERGE_MARGIN_M, IBVS_DIVERGE_MARGIN_PX,
                          IBVS_DIVERGE_PITCH_DEG, IBVS_DIVERGE_S, IBVS_FX,
                          IBVS_LATCH_SPEED, IBVS_LOSS_GRACE_S, IBVS_TARGET_FENCE_M,
@@ -75,7 +80,8 @@ def _build_detector():
 
 class SuasTracker:
 
-    def __init__(self, mav, pose_reader, camera_reader, show_window: bool = True):
+    def __init__(self, mav, pose_reader, camera_reader, show_window: bool = True,
+                 record_start_wp: int = 0):
         self._mav = mav
         self._pose = pose_reader
         self._cam = camera_reader
@@ -99,12 +105,14 @@ class SuasTracker:
         self._last_seen: Optional[float] = None      # last detection time (flicker grace)
         self._candidates: list = []       # {samples, n_seen, clat, clon, label}
         self._refine_log: float = 0.0     # TARGET_SAVED leader-log throttle
+        self._cand_log: float = 0.0       # MONITORING candidate-table log throttle
         self._guided_req_at: Optional[float] = None  # last set_mode(GUIDED) send time
         self._guided_first: Optional[float] = None   # first GUIDED request (timeout)
         self._goto_sent_at: Optional[float] = None   # last goto send (periodic resend)
         self._goto_start_at: Optional[float] = None  # GPS_GOTO start (overall timeout)
         self._goto_requested: bool = False           # main -> tracker: mission done, go
         self._settle_start: Optional[float] = None
+        self._goto_slow_log: float = 0.0  # "waiting to settle" log throttle
         self._drop_arrived_at: Optional[float] = None   # GPS_DROP arrival (settle timer)
         self._fire_settle_start: Optional[float] = None # AT_TARGET settle-then-release window
         self._fire_try_at: float = 0.0    # last release-gate attempt (~2 Hz throttle)
@@ -116,12 +124,18 @@ class SuasTracker:
         self._running: bool = False
         self._payload_proc: Optional[subprocess.Popen] = None
         self._payload_started: bool = False
+        # Target RECORDING gate (mapping start item). While record_start_wp > 0, MONITORING
+        # does not sample candidates until the AUTO mission reaches that item; the detector
+        # keeps running and drawing boxes. Once open, it stays open for that AUTO mission.
+        self._record_start_wp: int = max(0, int(record_start_wp))
+        self._record_open: bool = self._record_start_wp <= 0
+        self._monitor_since: float = 0.0  # MONITORING entry time (stale-message filter)
 
         # Optional live video stream of the annotated frames. Never affects flight.
         self._streamer = None
         if STREAM_ENABLED and not STREAM_HOST:
             log.warning('Live stream is enabled but STREAM_HOST is empty -- set it (or '
-                        'GROUND_STATION_IP) in config.json. Streaming stays off.')
+                        'GROUND_STATION_IP) in suas/config.py. Streaming stays off.')
         elif STREAM_ENABLED:
             try:
                 from suas.streaming.rtp import RtpH264Publisher
@@ -253,6 +267,11 @@ class SuasTracker:
             if mode == "AUTO":
                 log.info("AUTO detected -> MONITORING")
                 self._state = State.MONITORING
+                self._monitor_since = time.time()
+                self._record_open = self._record_start_wp <= 0
+                if not self._record_open:
+                    log.info("Target recording starts at mapping item seq>=%d "
+                             "(detector already running)", self._record_start_wp)
                 self._confirm_start = None
                 self._candidates = []         # new mission -> clear the candidate pool
                 self._visit_queue = []
@@ -266,6 +285,10 @@ class SuasTracker:
                 self._last_seen = None
                 return
 
+            # Nothing is recorded before the mapping start item (takeoff / lap / transit).
+            if not self._update_record_gate():
+                return
+
             if dets:
                 now = time.time()
                 if self._confirm_start is None:
@@ -275,6 +298,12 @@ class SuasTracker:
                 # Add EVERY detection in this frame to its per-class candidate cluster.
                 for d in dets:
                     self._collect_target_sample(d)
+                # Visibility: one line when a candidate first becomes ready, plus a
+                # ~0.5 Hz table of all candidates (both classes).
+                self._announce_new_ready()
+                if now - self._cand_log > 2.0:
+                    self._cand_log = now
+                    log.info("Candidates %s", self._candidate_table())
                 # Once the first VALID candidate is ready, move to TARGET_SAVED so
                 # main.trigger_goto has something to act on. The FINAL choice is made at the
                 # end of the mission (trigger_goto -> _commit_goto), which builds the queue.
@@ -307,6 +336,7 @@ class SuasTracker:
             if ACQUIRE_REFINE and dets and mode == "AUTO":
                 for d in dets:
                     self._collect_target_sample(d)
+                self._announce_new_ready()                # second target shows up immediately
                 best = self._best_candidate()
                 if best is not None:
                     tlat, tlon, nclean, ntot = self._robust_centroid(best["samples"])
@@ -315,10 +345,10 @@ class SuasTracker:
                     now = time.time()
                     if now - self._refine_log > 1.0:      # ~1 Hz log throttle
                         self._refine_log = now
-                        log.info("Leading candidate [%s]: %d frames (%d/%d clean) | "
-                                 "%d candidates -> %.6f, %.6f",
+                        log.info("Leading candidate [%s]: %d frames (%d/%d clean) -> "
+                                 "%.6f, %.6f | %s",
                                  best["label"], best["n_seen"], nclean, ntot,
-                                 len(self._candidates), tlat, tlon)
+                                 tlat, tlon, self._candidate_table())
 
         elif s == State.GPS_GOTO:
             now = time.time()
@@ -403,11 +433,21 @@ class SuasTracker:
                     self._settle_start = now
             else:
                 self._settle_start = None
-            if (dist < GOTO_RADIUS_M and self._settle_start is not None
-                    and now - self._settle_start >= GPS_SETTLE_SEC):
+            # SOFT ENTRY: the minimum settle time alone is not enough -- braking from
+            # 5 m/s takes ~2 s / 5 m, so the vehicle may still be moving when it expires and
+            # IBVS would start against momentum. Also require a low real ground speed.
+            # This only delays; it never commands motion (bounded by GOTO_TIMEOUT_S).
+            settled = self._pose.ground_speed <= GOTO_SETTLE_MAX_SPEED
+            arrived = (dist < GOTO_RADIUS_M and self._settle_start is not None
+                       and now - self._settle_start >= GPS_SETTLE_SEC)
+            if arrived and not settled and now - self._goto_slow_log > 2.0:
+                self._goto_slow_log = now
+                log.info("At target, waiting to settle (ground speed %.2f > %.2f m/s) "
+                         "before IBVS", self._pose.ground_speed, GOTO_SETTLE_MAX_SPEED)
+            if arrived and settled:
                 self._ibvs.reset()
-                # Apply this target's CURRENT tolerance level (starts at IBVS_CENTER_TOL_M;
-                # _defer_or_skip_current widens it one step after each failed attempt block).
+                # Apply this target's CURRENT ladder rung (IBVS_CENTER_TOL_LADDER);
+                # _defer_or_skip_current advances it when a rung's budget is used up.
                 tol = (self._current_target or {}).get("center_tol", IBVS_CENTER_TOL_M)
                 self._ibvs.center_tol = tol
                 log.info("Arrived (dist=%.1fm) -> IBVS (centring tolerance=%.1fm)", dist, tol)
@@ -525,11 +565,11 @@ class SuasTracker:
                 self._state = State.AT_TARGET
 
         elif s == State.GPS_DROP:
-            # LAST RESORT: IBVS could not centre this target within TARGET_MAX_ATTEMPTS, but
+            # LAST RESORT: IBVS could not centre this target on any rung of the ladder, but
             # the vehicle is HEALTHY -> fly to the target's SAVED GPS (survey robust
             # centroid), settle, release blind. Same safety gates as GPS_GOTO; genuine
             # DANGER -> HOVERING (never a blind drop). If it cannot be reached, skip it
-            # (attempts are already at the maximum, so there is no retry loop).
+            # (the ladder is exhausted, so there is no retry loop).
             now = time.time()
 
             # 0) Overall arrival timeout -- if we cannot reach the saved GPS, we cannot drop
@@ -677,6 +717,32 @@ class SuasTracker:
 
     # --- Helpers -------------------------------------------------------------
 
+    def _update_record_gate(self) -> bool:
+        """Is target recording open? It opens when the AUTO mission reaches the mapping
+        start item (record_start_wp) and then stays open for that mission. Either signal:
+          * MISSION_ITEM_REACHED.seq >= start  -> the start item (or a later one) was REACHED
+          * MISSION_CURRENT.seq      >  start  -> the start item was PASSED (a missed REACHED,
+                                                  or a mission resumed further on)
+        MISSION_CURRENT == start is deliberately NOT used: it is reported while still flying
+        TOWARD that item, which would record the transit. Messages received before entering
+        MONITORING (left over from a previous sortie) are ignored.
+        """
+        if self._record_open:
+            return True
+        msgs = self._mav.messages
+        now = time.time()
+        mir = msgs.get("MISSION_ITEM_REACHED")
+        mc = msgs.get("MISSION_CURRENT")
+        reached = (mir is not None and getattr(mir, "_timestamp", now) >= self._monitor_since
+                   and mir.seq >= self._record_start_wp)
+        passed = (mc is not None and getattr(mc, "_timestamp", now) >= self._monitor_since
+                  and mc.seq > self._record_start_wp)
+        if reached or passed:
+            self._record_open = True
+            log.info("Mapping start item reached (seq>=%d) -> target RECORDING STARTED",
+                     self._record_start_wp)
+        return self._record_open
+
     def _collect_target_sample(self, det: Detection):
         """Project a detection to GPS and add it to a positional CANDIDATE cluster.
 
@@ -699,6 +765,11 @@ class SuasTracker:
                 and (abs(p.pitch_deg) > ACQUIRE_TILT_MAX_DEG
                      or abs(p.roll_deg) > ACQUIRE_TILT_MAX_DEG)):
             return                                    # too tilted -> projection is distorted
+        # SPEED GATE: frame and pose are ~0.45 s apart, so the projection error grows with
+        # ground speed. Fast transit samples would drag the median -- reject them. This only
+        # discards samples; it can never cause an extra actuation.
+        if self._pose.ground_speed > ACQUIRE_MAX_SPEED:
+            return
         lat, lon = pixel_to_gps(det.cx, det.cy, p.lat, p.lon, p.alt, p.yaw_deg)
         cand = self._nearest_candidate(lat, lon, det.label)
         if cand is None:                              # new (class, position) -> new candidate
@@ -770,6 +841,35 @@ class SuasTracker:
         return (len(c["samples"]) >= ACQUIRE_MIN_SAMPLES
                 and self._cand_conf(c) >= CANDIDATE_MIN_CONF)
 
+    def _candidate_table(self, top: int = 6) -> str:
+        """One-line summary of every candidate, most-seen first, e.g.
+             [2 ready/5] mannequin 418f/0.55* | tent 335f/0.61* | mannequin 12f/0.31-
+        'Nf' = frames seen (n_seen), '/x.xx' = mean confidence, '*' = ready (_cand_ready).
+        """
+        if not self._candidates:
+            return "no candidates"
+        ranked = sorted(self._candidates, key=lambda c: -c["n_seen"])
+        nready = sum(1 for c in ranked if self._cand_ready(c))
+        parts = ["%s %df/%.2f%s" % (c["label"], c["n_seen"], self._cand_conf(c),
+                                    "*" if self._cand_ready(c) else "-") for c in ranked[:top]]
+        extra = "" if len(ranked) <= top else "  (+%d more)" % (len(ranked) - top)
+        return "[%d ready/%d] %s%s" % (nready, len(ranked), " | ".join(parts), extra)
+
+    def _announce_new_ready(self):
+        """Log ONE line the first time each candidate becomes ready (visibility only).
+
+        Without it only the leading candidate was logged, so the second target could stay
+        invisible on the terminal for the whole survey. Changes no decision or gate.
+        """
+        for c in self._candidates:
+            if c.get("ready_logged") or not self._cand_ready(c):
+                continue
+            c["ready_logged"] = True
+            lat, lon, nclean, ntot = self._robust_centroid(c["samples"])
+            log.info("NEW TARGET READY: %s | %d frames, mean conf %.2f (%d/%d clean) -> "
+                     "%.6f, %.6f | %s", c["label"], c["n_seen"], self._cand_conf(c),
+                     nclean, ntot, lat, lon, self._candidate_table())
+
     def _set_target_from(self, cand, why: str):
         """Write a candidate's robust centre to the target and freeze the safe altitude."""
         tlat, tlon, nclean, ntot = self._robust_centroid(cand["samples"])
@@ -837,11 +937,15 @@ class SuasTracker:
         for c in targets:
             tlat, tlon, _, _ = self._robust_centroid(c["samples"])
             dist = gps_distance_m(p.lat, p.lon, tlat, tlon) if self._pose.have_fix else 0.0
-            # "cand": candidate reference -> the position is refreshed if we see it en route.
-            # "attempts": IBVS attempt counter -> incremented on a recoverable abort.
+            # "cand"      : candidate reference -> refreshed if we see it en route
+            # "rung"      : index into IBVS_CENTER_TOL_LADDER (0 = strictest)
+            # "attempts"  : IBVS attempts on the CURRENT rung (reset when the rung advances)
+            # "goto_fails": GPS_GOTO arrival failures -- a SEPARATE counter, so an arrival
+            #               timeout can never use up the ladder and block the blind drop
             q.append({"lat": tlat, "lon": tlon, "label": c["label"],
-                      "n_seen": c["n_seen"], "dist": dist, "cand": c, "attempts": 0,
-                      "center_tol": IBVS_CENTER_TOL_M})   # escalating tolerance, strictest first
+                      "n_seen": c["n_seen"], "dist": dist, "cand": c,
+                      "rung": 0, "attempts": 0, "goto_fails": 0,
+                      "center_tol": IBVS_CENTER_TOL_LADDER[0][0]})
         q.sort(key=lambda t: t["dist"])              # NEAREST FIRST
         self._visit_queue = q
         log.info("Visit queue (%d targets, nearest first): %s", len(q),
@@ -866,11 +970,13 @@ class SuasTracker:
         p = self._pose.pose
         if self._pose.have_fix and p.alt > GOTO_MIN_ALT_M:
             self._target_alt = p.alt                 # refresh the safe survey altitude
-        log.info("FLYING TO TARGET -> %s (distance %.0fm, %d frames, attempt %d/%d) "
-                 "lat=%.6f lon=%.6f alt=%.1fm | %d remaining",
-                 t["label"], t["dist"], t["n_seen"], t.get("attempts", 0) + 1,
-                 TARGET_MAX_ATTEMPTS, t["lat"], t["lon"], self._target_alt,
-                 len(self._visit_queue))
+        rung = t.get("rung", 0)
+        rung_tol, rung_budget = IBVS_CENTER_TOL_LADDER[min(rung, len(IBVS_CENTER_TOL_LADDER) - 1)]
+        log.info("FLYING TO TARGET -> %s (distance %.0fm, %d frames | rung %d/%d: %.1fm, "
+                 "attempt %d/%d) lat=%.6f lon=%.6f alt=%.1fm | %d remaining",
+                 t["label"], t["dist"], t["n_seen"], rung + 1, len(IBVS_CENTER_TOL_LADDER),
+                 rung_tol, t.get("attempts", 0) + 1, rung_budget,
+                 t["lat"], t["lon"], self._target_alt, len(self._visit_queue))
         self._guided_req_at = None
         self._guided_first = None
         self._goto_sent_at = None
@@ -928,7 +1034,8 @@ class SuasTracker:
 
         recoverable=True -- "could not centre, but the vehicle is HEALTHY". The target is
           pushed to the BACK of the queue and we move to the next one, returning later.
-          After TARGET_MAX_ATTEMPTS it is skipped (infinite-loop guard). A deferred target's
+          When the whole IBVS_CENTER_TOL_LADDER is used up, the blind GPS drop follows (or the
+          target is skipped if that is disabled -- infinite-loop guard). A deferred target's
           position is refreshed if we see it en route.
           Callers: detection loss and timeout are ALWAYS recoverable; geofence and
           divergence use recoverable=SIM_MODE (an artefact in sim; a real fault in flight).
@@ -954,61 +1061,84 @@ class SuasTracker:
         self._state = State.HOVERING
 
     def _defer_or_skip_current(self, why: str, allow_gps_drop: bool = False):
-        """Handle a recoverable failure (IBVS could not centre, or GPS_GOTO could not arrive)
-        while the vehicle is HEALTHY.
+        """Handle a recoverable failure while the vehicle is HEALTHY: push the current target
+        to the BACK of the queue and move on, so the other target(s) are handled first and we
+        return afterwards. The caller must already have stopped the vehicle (control.stop).
 
-        Push the current target to the BACK of the queue and move to the next one, so the
-        other target(s) are handled first and we return afterwards. Once
-        TARGET_MAX_ATTEMPTS is reached:
-          * allow_gps_drop=True and GPS_DROP_FALLBACK (IBVS centring failure -- the vehicle
-            is over the target and healthy): fly to the saved GPS and release blind instead
-            of skipping, so the target still scores (see _begin_gps_drop).
-          * otherwise (e.g. GPS_GOTO could never arrive -- a blind drop could not reach it
-            either): SKIP the target.
+        Two independent paths with independent budgets:
 
-        With no current target we hover, to be safe. The caller must already have stopped
-        the vehicle (control.stop).
+        allow_gps_drop=True  -> IBVS COULD NOT CENTRE (vehicle over the target, healthy).
+            Escalating ladder IBVS_CENTER_TOL_LADDER: each rung has its own attempt budget;
+            when it is used up the next rung (wider tolerance) starts with a fresh budget.
+            After the last rung: blind drop at the saved GPS (GPS_DROP_FALLBACK) instead of
+            skipping, so the target can still score.
+
+        allow_gps_drop=False -> GPS_GOTO COULD NOT ARRIVE (arrival timeout). A wider
+            tolerance cannot reach an unreachable coordinate and a blind drop would fly to the
+            same place, so the separate "goto_fails" counter is used and the target is
+            skipped after TARGET_MAX_ATTEMPTS. This never consumes the IBVS ladder.
+
+        With a single target "defer" degenerates to an immediate retry of the same target.
+        With no current target we hover, to be safe.
         """
         cur = self._current_target
         if cur is None:
             self._state = State.HOVERING
             return
-        cur["attempts"] = cur.get("attempts", 0) + 1
-        cur_tol = cur.get("center_tol", IBVS_CENTER_TOL_M)
-        if cur["attempts"] < TARGET_MAX_ATTEMPTS:
-            self._visit_queue.append(cur)            # to the BACK -> we return later
-            log.warning("%s -> %s deferred (attempt %d/%d, tolerance %.1fm) | moving to the "
-                        "next target.", why, cur["label"], cur["attempts"],
-                        TARGET_MAX_ATTEMPTS, cur_tol)
-            self._current_target = None
-            self._start_next_target()                # next target (HOVERING if the queue is empty)
-            return
-        # Attempts exhausted at this tolerance level.
-        # ESCALATING TOLERANCE (only for an IBVS CENTRING failure, i.e. allow_gps_drop=True):
-        # try STRICT (IBVS_CENTER_TOL_M) TARGET_MAX_ATTEMPTS times; if that fails, widen one
-        # step (2 -> 6 -> 10), reset the counter and requeue. If even the ceiling
-        # (IBVS_CENTER_TOL_MAX_M) fails, fall back to the blind GPS drop.
-        # (When GPS_GOTO could never ARRIVE, allow_gps_drop is False and there is NO
-        #  escalation -- correctly, since a wider tolerance cannot reach an unreachable
-        #  coordinate.)
-        if (allow_gps_drop and IBVS_CENTER_TOL_STEP_M > 0
-                and cur_tol < IBVS_CENTER_TOL_MAX_M):
-            new_tol = min(cur_tol + IBVS_CENTER_TOL_STEP_M, IBVS_CENTER_TOL_MAX_M)
-            cur["center_tol"] = new_tol
-            cur["attempts"] = 0                      # fresh attempt budget at the new tolerance
-            self._visit_queue.append(cur)
-            log.warning("%s -> %s not centred in %d attempts -> tolerance widened %.1f->%.1fm, "
-                        "will retry", why, cur["label"], TARGET_MAX_ATTEMPTS, cur_tol, new_tol)
+
+        def _next_hint():
+            return ("moving to the next target." if self._visit_queue
+                    else "no other target queued -> retrying the SAME target now.")
+
+        # (A) GPS_GOTO arrival failure -- separate budget, no ladder
+        if not allow_gps_drop:
+            cur["goto_fails"] = cur.get("goto_fails", 0) + 1
+            if cur["goto_fails"] < TARGET_MAX_ATTEMPTS:
+                self._visit_queue.append(cur)
+                log.warning("%s -> %s deferred (arrival attempt %d/%d) | %s", why, cur["label"],
+                            cur["goto_fails"], TARGET_MAX_ATTEMPTS, _next_hint())
+                self._current_target = None
+                self._start_next_target()
+                return
+            log.warning("%s -> %s could not be REACHED %d times -> SKIPPING (a blind drop would "
+                        "fly to the same coordinate)", why, cur["label"], TARGET_MAX_ATTEMPTS)
             self._current_target = None
             self._start_next_target()
             return
-        # The widest tolerance failed too (or the target is unreachable) -> last resort.
-        if allow_gps_drop and GPS_DROP_FALLBACK:
-            log.warning("%s -> %s could not be centred even at %.1fm -> LAST RESORT: blind drop "
-                        "at the saved GPS", why, cur["label"], cur_tol)
+
+        # (B) IBVS centring failure -- escalating ladder
+        rung = min(cur.get("rung", 0), len(IBVS_CENTER_TOL_LADDER) - 1)
+        tol, budget = IBVS_CENTER_TOL_LADDER[rung]
+        cur["attempts"] = cur.get("attempts", 0) + 1
+        if cur["attempts"] < budget:                 # attempts left on this rung
+            self._visit_queue.append(cur)
+            log.warning("%s -> %s deferred (rung %d/%d: %.1fm, attempt %d/%d) | %s",
+                        why, cur["label"], rung + 1, len(IBVS_CENTER_TOL_LADDER), tol,
+                        cur["attempts"], budget, _next_hint())
+            self._current_target = None
+            self._start_next_target()
+            return
+        if rung + 1 < len(IBVS_CENTER_TOL_LADDER):   # next rung, fresh budget
+            new_tol, new_budget = IBVS_CENTER_TOL_LADDER[rung + 1]
+            cur["rung"] = rung + 1
+            cur["attempts"] = 0
+            cur["center_tol"] = new_tol              # drives the IBVS deadband + latch
+            self._visit_queue.append(cur)
+            log.warning("%s -> %s not centred on rung %d (%.1fm) -> RUNG %d: tolerance "
+                        "%.1f->%.1fm, %d attempt(s)", why, cur["label"], rung + 1, tol,
+                        rung + 2, tol, new_tol, new_budget)
+            self._current_target = None
+            self._start_next_target()
+            return
+        if GPS_DROP_FALLBACK:                        # ladder exhausted -> last resort
+            log.warning("%s -> %s not centred on the whole ladder (%s, %d attempts) -> "
+                        "LAST RESORT: blind drop at the saved GPS", why, cur["label"],
+                        " + ".join("%.0fm x%d" % r for r in IBVS_CENTER_TOL_LADDER),
+                        IBVS_CENTER_TOL_ATTEMPTS_TOTAL)
             self._begin_gps_drop()                   # _current_target stays = the dropped target
             return
-        log.warning("%s -> %s failed -> SKIPPING (attempt limit)", why, cur["label"])
+        log.warning("%s -> %s ladder exhausted and GPS_DROP_FALLBACK=False -> SKIPPING",
+                    why, cur["label"])
         self._current_target = None
         self._start_next_target()
 
@@ -1177,7 +1307,7 @@ class SuasTracker:
         """Launch the payload drop sequence as a SEPARATE process.
 
         The target class selects the servo, motor and release angle; the single source of
-        truth for that mapping is PAYLOAD_TARGETS in config.json.
+        truth for that mapping is PAYLOAD_TARGETS in suas/config.py.
 
         This does NOT block the tracker loop:
           * subprocess.Popen returns immediately; the state machine keeps running.
@@ -1207,12 +1337,12 @@ class SuasTracker:
             self._stop_payload()   # never overwrite a live handle -> no orphaned motor
 
         # Target class -> the --target argument that selects the servo and motor. The set of
-        # valid classes comes from PAYLOAD_TARGETS in config.json, so changing the classes
+        # valid classes comes from PAYLOAD_TARGETS in suas/config.py, so changing the classes
         # does not need a code edit. A class with no entry there (or an empty label) NEVER
         # triggers a motor.
         target = self._target_label
         if target not in PAYLOAD_TARGETS:
-            log.warning("Payload: '%s' has no entry in PAYLOAD_TARGETS (config.json) -> no "
+            log.warning("Payload: '%s' has no entry in PAYLOAD_TARGETS (suas/config.py) -> no "
                         "actuation (skipped). Configured targets: %s",
                         target, sorted(PAYLOAD_TARGETS) or "(none)")
             return
@@ -1274,6 +1404,8 @@ class SuasTracker:
             f"Mode  : {self._pose.mode}",
             f"Alt   : {p.alt:.1f}m  Yaw: {p.yaw_deg:.0f}",
             f"Pitch : {p.pitch_deg:.1f}  Roll: {p.roll_deg:.1f}",
+            "Record: " + ("ON" if self._record_open
+                          else "WAITING (seq>=%d)" % self._record_start_wp),
         ]
         for i, txt in enumerate(lines):
             cv2.putText(frame, txt, (10, 22 + i * 20),

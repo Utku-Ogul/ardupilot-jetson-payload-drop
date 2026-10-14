@@ -2,8 +2,8 @@
 # -----------------------------------------------------------------------------
 # Start ArduPilot SITL together with a Gazebo world, for testing without a vehicle.
 #
-# The companion computer connects to the UDP endpoint below; set "SIM_MODE": true in
-# config.json so it listens on udpin:0.0.0.0:14560.
+# The companion computer connects to the UDP endpoint below; set SIM_MODE = True in
+# suas/config.py so it listens on udpin:0.0.0.0:14560.
 #
 # Expected layout (siblings of this repository):
 #   ../ardupilot          ArduPilot source tree (sim_vehicle.py)

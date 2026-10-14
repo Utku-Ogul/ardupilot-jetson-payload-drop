@@ -45,10 +45,12 @@ FENCE_ENABLE,1          # geofence on (the last wall)
 FENCE_TYPE,11           # max altitude + circle + min altitude
 FENCE_ACTION,4          # Brake in simulation; NEVER 0
 FENCE_RADIUS,120        # horizontal fence radius [m]
-FENCE_ALT_MAX,50        # survey altitude plus margin
+FENCE_ALT_MAX,80        # 50 m survey altitude plus margin
 FENCE_MARGIN,6          # stopping distance allowance
-FS_GCS_ENABLE,1         # RTL if the companion heartbeat (sysid 254) stops
-FS_GCS_TIMEOUT,5        # seconds from heartbeat loss to failsafe
-MAV_GCS_SYSID,254       # MUST match the companion source_system (FW < 4.5: SYSID_MYGCS)
+FS_GCS_ENABLE,1         # RTL if the GROUND STATION (sysid 255) heartbeat is lost
+FS_GCS_TIMEOUT,15       # SUAS 2026: 15 s comms loss -> RTL
+SYSID_MYGCS,255         # the ground station (Mission Planner / MAVProxy); the companion stays 254
+SYSID_ENFORCE,0         # MUST be 0, or the companion's (254) GUIDED/velocity commands are rejected
+FS_OPTIONS,0            # RTL on GCS loss in every mode (bit 1 off)
 FS_EKF_ACTION,1         # land if the EKF diverges
 FS_EKF_THRESH,0.8
